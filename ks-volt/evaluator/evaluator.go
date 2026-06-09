@@ -2,6 +2,7 @@ package evaluator
 
 import (
 	"fmt"
+	"io"
 	"ks-volt/ast"
 	"net/http"
 	"sync"
@@ -53,11 +54,14 @@ func (ev *Evaluator) Eval(node ast.Node, env *Environment) interface{} {
 		ev.wg.Add(1)
 		go func() {
 			defer ev.wg.Done()
-			// We might want to pass arguments to the "function" if we had real functions,
-			// but for now let's just evaluate the body.
 			ev.Eval(n.Body, env)
 		}()
 		return nil
+
+	case *ast.InfixExpression:
+		left := ev.Eval(n.Left, env)
+		right := ev.Eval(n.Right, env)
+		return ev.evalInfixExpression(n.Operator, left, right)
 
 	case *ast.CallExpression:
 		functionName := ""
@@ -76,7 +80,7 @@ func (ev *Evaluator) Eval(node ast.Node, env *Environment) interface{} {
 		if val, ok := env.Get(n.Value); ok {
 			return val
 		}
-		return n.Value // Return literal name if not in env (for builtins/function names)
+		return n.Value
 
 	case *ast.IntegerLiteral:
 		return n.Value
@@ -96,6 +100,16 @@ func (ev *Evaluator) evalStatements(stmts []ast.Statement, env *Environment) int
 	return result
 }
 
+func (ev *Evaluator) evalInfixExpression(operator string, left, right interface{}) interface{} {
+	switch operator {
+	case "+":
+		res := fmt.Sprintf("%v%v", left, right)
+		return res
+	default:
+		return nil
+	}
+}
+
 func (ev *Evaluator) applyBuiltin(name string, args []interface{}) interface{} {
 	switch name {
 	case "print":
@@ -108,20 +122,30 @@ func (ev *Evaluator) applyBuiltin(name string, args []interface{}) interface{} {
 		port := fmt.Sprintf(":%v", args[0])
 		html := fmt.Sprintf("%v", args[1])
 
-		// We need to be careful with starting multiple servers on same port or root,
-		// but for KS-Volt MVP this is fine.
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, html)
 		})
 
-		// This is a blocking call in Go, so we should probably run it in a way
-		// that doesn't block the WHOLE evaluator if it's called inside spawn.
-		// Since it's usually called inside spawn in our example, it's fine.
 		err := http.ListenAndServe(port, nil)
 		if err != nil {
 			fmt.Printf("Error starting server: %s\n", err)
 		}
 		return nil
+	case "fetch_api":
+		if len(args) != 1 {
+			return fmt.Errorf("fetch_api requires 1 argument: url")
+		}
+		url := fmt.Sprintf("%v", args[0])
+		resp, err := http.Get(url)
+		if err != nil {
+			return fmt.Sprintf("Error fetching API: %s", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Sprintf("Error reading API response: %s", err)
+		}
+		return string(body)
 	default:
 		return nil
 	}

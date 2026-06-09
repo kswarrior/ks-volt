@@ -8,6 +8,18 @@ import (
 	"strconv"
 )
 
+const (
+	_ int = iota
+	LOWEST
+	SUM // +
+	CALL // function(args)
+)
+
+var precedences = map[token.TokenType]int{
+	token.PLUS:   SUM,
+	token.LPAREN: CALL,
+}
+
 type Parser struct {
 	l      *lexer.Lexer
 	errors []string
@@ -58,6 +70,8 @@ func (p *Parser) parseStatement() ast.Statement {
 			return p.parseAssignmentStatement()
 		}
 		return p.parseExpressionStatement()
+	case token.PRINT, token.SERVE_HTML, token.FETCH_API:
+		return p.parseExpressionStatement()
 	default:
 		return p.parseExpressionStatement()
 	}
@@ -97,7 +111,7 @@ func (p *Parser) parseAssignmentStatement() *ast.AssignmentStatement {
 
 	p.nextToken()
 
-	stmt.Value = p.parseExpression()
+	stmt.Value = p.parseExpression(LOWEST)
 
 	return stmt
 }
@@ -105,7 +119,7 @@ func (p *Parser) parseAssignmentStatement() *ast.AssignmentStatement {
 func (p *Parser) parseExpressionStatement() *ast.ExpressionStatement {
 	stmt := &ast.ExpressionStatement{Token: p.curToken}
 
-	stmt.Expression = p.parseExpression()
+	stmt.Expression = p.parseExpression(LOWEST)
 
 	return stmt
 }
@@ -127,7 +141,7 @@ func (p *Parser) parseBlockStatement() *ast.BlockStatement {
 	return block
 }
 
-func (p *Parser) parseExpression() ast.Expression {
+func (p *Parser) parseExpression(precedence int) ast.Expression {
 	var leftExp ast.Expression
 
 	switch p.curToken.Type {
@@ -141,14 +155,40 @@ func (p *Parser) parseExpression() ast.Expression {
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	case token.SERVE_HTML:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.FETCH_API:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	default:
+		return nil
 	}
 
-	if p.peekToken.Type == token.LPAREN {
-		p.nextToken()
-		leftExp = p.parseCallExpression(leftExp)
+	for p.peekToken.Type != token.EOF && precedence < p.peekPrecedence() {
+		switch p.peekToken.Type {
+		case token.PLUS:
+			p.nextToken()
+			leftExp = p.parseInfixExpression(leftExp)
+		case token.LPAREN:
+			p.nextToken()
+			leftExp = p.parseCallExpression(leftExp)
+		default:
+			return leftExp
+		}
 	}
 
 	return leftExp
+}
+
+func (p *Parser) parseInfixExpression(left ast.Expression) ast.Expression {
+	expression := &ast.InfixExpression{
+		Token:    p.curToken,
+		Operator: p.curToken.Literal,
+		Left:     left,
+	}
+
+	precedence := p.curPrecedence()
+	p.nextToken()
+	expression.Right = p.parseExpression(precedence)
+
+	return expression
 }
 
 func (p *Parser) parseIntegerLiteral() ast.Expression {
@@ -179,12 +219,12 @@ func (p *Parser) parseCallArguments() []ast.Expression {
 	}
 
 	p.nextToken()
-	args = append(args, p.parseExpression())
+	args = append(args, p.parseExpression(LOWEST))
 
 	for p.peekToken.Type == token.COMMA {
 		p.nextToken()
 		p.nextToken()
-		args = append(args, p.parseExpression())
+		args = append(args, p.parseExpression(LOWEST))
 	}
 
 	if !p.expectPeek(token.RPAREN) {
@@ -192,6 +232,20 @@ func (p *Parser) parseCallArguments() []ast.Expression {
 	}
 
 	return args
+}
+
+func (p *Parser) peekPrecedence() int {
+	if p, ok := precedences[p.peekToken.Type]; ok {
+		return p
+	}
+	return LOWEST
+}
+
+func (p *Parser) curPrecedence() int {
+	if p, ok := precedences[p.curToken.Type]; ok {
+		return p
+	}
+	return LOWEST
 }
 
 func (p *Parser) curTokenIs(t token.TokenType) bool {

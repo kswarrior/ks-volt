@@ -1,5 +1,12 @@
 PORT = 8080
+API_URL = "https://worldtimeapi.org/api/timezone/Etc/UTC"
+
 spawn start_web_ui(PORT) {
-    print("⚡ KS-Volt Web UI server is spinning up...")
-    serve_html(PORT, "<h1>Hello World from KS-Volt!</h1>")
+    print("⚡ KS-Volt Web UI server is spinning up on port: " + PORT)
+
+    // Fetch some dynamic data
+    data = fetch_api(API_URL)
+    print("Fetched dynamic data: " + data)
+
+    serve_html(PORT, "<h1>Hello World from KS-Volt!</h1><p>Data from API: " + data + "</p>")
 }

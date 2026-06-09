@@ -18,6 +18,7 @@ const (
 
 	// Operators
 	ASSIGN = "="
+	PLUS   = "+"
 
 	// Delimiters
 	COMMA  = ","
@@ -30,12 +31,14 @@ const (
 	SPAWN      = "SPAWN"
 	PRINT      = "PRINT"
 	SERVE_HTML = "SERVE_HTML"
+	FETCH_API  = "FETCH_API"
 )
 
 var keywords = map[string]TokenType{
 	"spawn":      SPAWN,
 	"print":      PRINT,
 	"serve_html": SERVE_HTML,
+	"fetch_api":  FETCH_API,
 }
 
 func LookupIdent(ident string) TokenType {
