@@ -36,8 +36,10 @@ func (c *Compiler) Compile(program *ast.Program) string {
 	// Runtime helper functions
 	sb.WriteString(`
 var (
-	dbMutex sync.RWMutex
-	wg      sync.WaitGroup
+	dbMutex        sync.RWMutex
+	wg             sync.WaitGroup
+	eventsMutex    sync.RWMutex
+	eventHandlers  = make(map[string][]func())
 )
 
 func dbSave(key, value string) {
@@ -78,6 +80,29 @@ func fetchAPI(url string) string {
 	return string(body)
 }
 
+func fileWrite(filename, data string) {
+	os.WriteFile(filename, []byte(data), 0644)
+}
+
+func onEvent(name string, handler func()) {
+	eventsMutex.Lock()
+	defer eventsMutex.Unlock()
+	eventHandlers[name] = append(eventHandlers[name], handler)
+}
+
+func emitEvent(name string) {
+	eventsMutex.RLock()
+	defer eventsMutex.RUnlock()
+	handlers := eventHandlers[name]
+	for _, handler := range handlers {
+		wg.Add(1)
+		go func(h func()) {
+			defer wg.Done()
+			h()
+		}(handler)
+	}
+}
+
 func serveHTML(port interface{}, html string) {
 	portStr := fmt.Sprintf(":%v", port)
 	mux := http.NewServeMux()
@@ -106,6 +131,17 @@ func connectBot(server, port interface{}, body func()) {
 		body()
 	}()
 }
+
+func runInterval(ms int64, body func()) {
+	ticker := time.NewTicker(time.Duration(ms) * time.Millisecond)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range ticker.C {
+			body()
+		}
+	}()
+}
 `)
 
 	sb.WriteString("\nfunc main() {\n")
@@ -131,10 +167,16 @@ func (c *Compiler) compileStatement(stmt ast.Statement, indent string) string {
 	case *ast.ExpressionStatement:
 		return fmt.Sprintf("%s%s\n", indent, c.compileExpression(s.Expression))
 	case *ast.SpawnStatement:
-		if s.Name.Value == "connect_bot" {
+		switch s.Name.Value {
+		case "connect_bot":
 			return c.compileConnectBot(s, indent)
+		case "interval":
+			return c.compileInterval(s, indent)
+		case "on":
+			return c.compileOn(s, indent)
+		default:
+			return c.compileSpawn(s, indent)
 		}
-		return c.compileSpawn(s, indent)
 	}
 	return ""
 }
@@ -177,6 +219,10 @@ func (c *Compiler) compileCall(e *ast.CallExpression) string {
 		return fmt.Sprintf("fetchAPI(%s)", args[0])
 	case "serve_html":
 		return fmt.Sprintf("serveHTML(%s, %s)", args[0], args[1])
+	case "file_write":
+		return fmt.Sprintf("fileWrite(%s, %s)", args[0], args[1])
+	case "emit":
+		return fmt.Sprintf("emitEvent(%s)", args[0])
 	}
 	return ""
 }
@@ -199,6 +245,28 @@ func (c *Compiler) compileConnectBot(s *ast.SpawnStatement, indent string) strin
 	port := c.compileExpression(s.Args[1])
 
 	sb.WriteString(fmt.Sprintf("%sconnectBot(%s, %s, func() {\n", indent, server, port))
+	for _, stmt := range s.Body.Statements {
+		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
+	}
+	sb.WriteString(fmt.Sprintf("%s})\n", indent))
+	return sb.String()
+}
+
+func (c *Compiler) compileInterval(s *ast.SpawnStatement, indent string) string {
+	var sb strings.Builder
+	ms := c.compileExpression(s.Args[0])
+	sb.WriteString(fmt.Sprintf("%srunInterval(int64(%s), func() {\n", indent, ms))
+	for _, stmt := range s.Body.Statements {
+		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
+	}
+	sb.WriteString(fmt.Sprintf("%s})\n", indent))
+	return sb.String()
+}
+
+func (c *Compiler) compileOn(s *ast.SpawnStatement, indent string) string {
+	var sb strings.Builder
+	eventName := c.compileExpression(s.Args[0])
+	sb.WriteString(fmt.Sprintf("%sonEvent(%s, func() {\n", indent, eventName))
 	for _, stmt := range s.Body.Statements {
 		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
 	}

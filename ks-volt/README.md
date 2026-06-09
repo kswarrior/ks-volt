@@ -11,6 +11,9 @@ KS-Volt is a high-performance, minimalist programming language designed for maxi
 - **Built-in Web Engine**: Effortlessly serve HTML and interact with APIs.
 - **Embedded Local Database**: Persistent, thread-safe key-value storage out of the box.
 - **Raw Networking**: Native support for socket connections and bot streaming.
+- **Timing Primitives**: Node.js-style intervals for recurring tasks.
+- **Global Event System**: Asynchronous event-driven architecture (on/emit).
+- **File I/O**: Seamless raw file writing to disk.
 
 ## 🛠️ Language Syntax
 
@@ -48,6 +51,32 @@ Asynchronous TCP connections for bots or custom socket protocols.
 spawn connect_bot("127.0.0.1", 25565) {
     print("🤖 Bot connected!")
 }
+```
+
+### Intervals
+Recurring tasks using the `interval` keyword.
+```kv
+spawn timer() {
+    interval(1000) {
+        print("One second passed")
+    }
+}
+```
+
+### Event System
+Decouple logic using global events.
+```kv
+on("alert") {
+    print("⚠️ ALERT RECEIVED")
+}
+
+emit("alert")
+```
+
+### File I/O
+Write data directly to files.
+```kv
+file_write("log.txt", "Operation successful")
 ```
 
 ## 📈 Performance & Load

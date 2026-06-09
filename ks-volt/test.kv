@@ -1,19 +1,22 @@
 PORT = 8080
-STATUS = "ACTIVE"
+LOG_FILE = "bot_log.txt"
 
-// Pillar A: Dynamic UI & Strings
-spawn start_web_ui(PORT) {
-    print("⚡ KS-Volt Web UI spinning up on port: " + PORT)
-    serve_html(PORT, "<h1>Status: " + STATUS + "</h1>")
+// Event listener for heartbeats
+on("heartbeat") {
+    print("💓 Heartbeat event received!")
+    file_write(LOG_FILE, "Heartbeat at " + "now") // Simplified timestamp
 }
 
-// Pillar B: Embedded Local Database
-db_save("bot_state", "ready")
-current_state = db_get("bot_state")
-print("Data bank state is: " + current_state)
+spawn start_services() {
+    print("🚀 Services starting...")
 
-// Pillar C: Raw Network Connection (Minecraft Bots/Sockets)
-SERVER = "127.0.0.1"
-spawn connect_bot(SERVER, 25565) {
-    print("🤖 Bot successfully streamed connection to " + SERVER)
+    // Emit heartbeat every 2 seconds
+    interval(2000) {
+        print("⏲️ Triggering heartbeat...")
+        emit("heartbeat")
+    }
+}
+
+spawn web_server(PORT) {
+    serve_html(PORT, "<h1>KS-Volt Live Dashboard</h1>")
 }

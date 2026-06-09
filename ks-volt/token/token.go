@@ -33,8 +33,12 @@ const (
 	SERVE_HTML = "SERVE_HTML"
 	FETCH_API  = "FETCH_API"
 	DB_SAVE    = "DB_SAVE"
-	DB_GET     = "DB_GET"
+	DB_GET      = "DB_GET"
 	CONNECT_BOT = "CONNECT_BOT"
+	INTERVAL    = "INTERVAL"
+	FILE_WRITE  = "FILE_WRITE"
+	ON          = "ON"
+	EMIT        = "EMIT"
 )
 
 var keywords = map[string]TokenType{
@@ -45,6 +49,10 @@ var keywords = map[string]TokenType{
 	"db_save":     DB_SAVE,
 	"db_get":      DB_GET,
 	"connect_bot": CONNECT_BOT,
+	"interval":    INTERVAL,
+	"file_write":  FILE_WRITE,
+	"on":          ON,
+	"emit":        EMIT,
 }
 
 func LookupIdent(ident string) TokenType {

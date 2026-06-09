@@ -63,7 +63,7 @@ func (p *Parser) ParseProgram() *ast.Program {
 
 func (p *Parser) parseStatement() ast.Statement {
 	switch p.curToken.Type {
-	case token.SPAWN, token.CONNECT_BOT:
+	case token.SPAWN, token.CONNECT_BOT, token.INTERVAL, token.ON:
 		return p.parseSpawnStatement()
 	case token.IDENT:
 		if p.peekToken.Type == token.ASSIGN {
@@ -165,6 +165,10 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 	case token.DB_GET:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	case token.CONNECT_BOT:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.FILE_WRITE:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.EMIT:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
 		return nil
