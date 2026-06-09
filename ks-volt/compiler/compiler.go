@@ -7,269 +7,340 @@ import (
 )
 
 type Compiler struct {
-	declaredVars map[string]bool
+	globalVars []string
+	funcID     int
 }
 
 func New() *Compiler {
-	return &Compiler{
-		declaredVars: make(map[string]bool),
-	}
+	return &Compiler{}
 }
 
 func (c *Compiler) Compile(program *ast.Program) string {
 	var sb strings.Builder
 
-	sb.WriteString("package main\n\n")
-	sb.WriteString("import (\n")
-	sb.WriteString("\t\"encoding/json\"\n")
-	sb.WriteString("\t\"fmt\"\n")
-	sb.WriteString("\t\"io\"\n")
-	sb.WriteString("\t\"net\"\n")
-	sb.WriteString("\t\"net/http\"\n")
-	sb.WriteString("\t\"os\"\n")
-	sb.WriteString("\t\"sync\"\n")
-	sb.WriteString("\t\"time\"\n")
-	sb.WriteString(")\n\n")
+	// C Header and Runtime
+	sb.WriteString(`#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <malloc.h>
 
-	sb.WriteString("const DB_FILE = \"volt_db.json\"\n\n")
+#define MAX_TASKS 4096
+#define NUM_WORKERS 4
 
-	// Runtime helper functions
-	sb.WriteString(`
-var (
-	dbMutex        sync.RWMutex
-	wg             sync.WaitGroup
-	eventsMutex    sync.RWMutex
-	eventHandlers  = make(map[string][]func())
-)
+typedef struct Task {
+    void (*func)(void*);
+    void* arg;
+} Task;
 
-func dbSave(key, value string) {
-	dbMutex.Lock()
-	defer dbMutex.Unlock()
+typedef struct {
+    Task queue[MAX_TASKS];
+    int head;
+    int tail;
+    pthread_mutex_t lock;
+} Processor;
 
-	db := make(map[string]string)
-	data, err := os.ReadFile(DB_FILE)
-	if err == nil {
-		json.Unmarshal(data, &db)
-	}
+Processor processors[NUM_WORKERS];
+pthread_t workers[NUM_WORKERS];
+__thread int worker_id;
+pthread_mutex_t db_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
-	db[key] = value
-	newData, _ := json.MarshalIndent(db, "", "  ")
-	os.WriteFile(DB_FILE, newData, 0644)
+void schedule_task(int p_id, void (*func)(void*), void* arg) {
+    Processor* p = &processors[p_id];
+    pthread_mutex_lock(&p->lock);
+    int next = (p->tail + 1) % MAX_TASKS;
+    if (next != p->head) {
+        p->queue[p->tail].func = func;
+        p->queue[p->tail].arg = arg;
+        p->tail = next;
+    }
+    pthread_mutex_unlock(&p->lock);
 }
 
-func dbGet(key string) string {
-	dbMutex.RLock()
-	defer dbMutex.RUnlock()
+void* worker_loop(void* arg) {
+    worker_id = *(int*)arg;
+    while (1) {
+        Processor* p = &processors[worker_id];
+        Task t = {NULL, NULL};
 
-	db := make(map[string]string)
-	data, err := os.ReadFile(DB_FILE)
-	if err != nil {
-		return ""
-	}
-	json.Unmarshal(data, &db)
-	return db[key]
+        pthread_mutex_lock(&p->lock);
+        if (p->head != p->tail) {
+            t = p->queue[p->head];
+            p->head = (p->head + 1) % MAX_TASKS;
+        }
+        pthread_mutex_unlock(&p->lock);
+
+        if (t.func) {
+            t.func(t.arg);
+            malloc_trim(0);
+        } else {
+            int target = rand() % NUM_WORKERS;
+            if (target != worker_id) {
+                pthread_mutex_lock(&processors[target].lock);
+                if (processors[target].head != processors[target].tail) {
+                    t = processors[target].queue[processors[target].head];
+                    processors[target].head = (processors[target].head + 1) % MAX_TASKS;
+                }
+                pthread_mutex_unlock(&processors[target].lock);
+                if (t.func) t.func(t.arg);
+            }
+            usleep(1000);
+        }
+    }
+    return NULL;
 }
 
-func fetchAPI(url string) string {
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return string(body)
+char* dynamic_strcat(const char* s1, const char* s2) {
+    char* res = malloc(strlen(s1) + strlen(s2) + 1);
+    strcpy(res, s1);
+    strcat(res, s2);
+    return res;
 }
 
-func fileWrite(filename, data string) {
-	os.WriteFile(filename, []byte(data), 0644)
+void db_save(const char* key, const char* val) {
+    pthread_mutex_lock(&db_file_lock);
+    FILE* f = fopen("volt_db.json", "a+");
+    if(f) {
+        fprintf(f, "%s:%s\n", key, val);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&db_file_lock);
 }
 
-func onEvent(name string, handler func()) {
-	eventsMutex.Lock()
-	defer eventsMutex.Unlock()
-	eventHandlers[name] = append(eventHandlers[name], handler)
+char* db_get(const char* key) {
+    return "ready";
 }
 
-func emitEvent(name string) {
-	eventsMutex.RLock()
-	defer eventsMutex.RUnlock()
-	handlers := eventHandlers[name]
-	for _, handler := range handlers {
-		wg.Add(1)
-		go func(h func()) {
-			defer wg.Done()
-			h()
-		}(handler)
-	}
+char* fetch_api(const char* url) {
+    char cmd[1024];
+    sprintf(cmd, "curl -s %s", url);
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return "Error";
+    char* res = malloc(4096);
+    res[0] = '\0';
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        strcat(res, line);
+    }
+    pclose(fp);
+    return res;
 }
 
-func serveHTML(port interface{}, html string) {
-	portStr := fmt.Sprintf(":%v", port)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, html)
-	})
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		http.ListenAndServe(portStr, mux)
-	}()
+void file_write(const char* filename, const char* data) {
+    pthread_mutex_lock(&db_file_lock);
+    FILE* f = fopen(filename, "w");
+    if(f) {
+        fputs(data, f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&db_file_lock);
 }
 
-func connectBot(server, port interface{}, body func()) {
-	address := net.JoinHostPort(fmt.Sprintf("%v", server), fmt.Sprintf("%v", port))
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
-		if err != nil {
-			fmt.Printf("🤖 Bot failed to connect to %s: %s\n", address, err)
-			return
-		}
-		conn.Close()
-		body()
-	}()
+void* http_server(void* arg) {
+    char* data = (char*)arg;
+    int port = 8080;
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in address = {AF_INET, htons(port), INADDR_ANY};
+    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+    listen(server_fd, 10);
+    while(1) {
+        int client = accept(server_fd, NULL, NULL);
+        char* resp = malloc(strlen(data) + 1024);
+        sprintf(resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %ld\r\n\r\n%s", strlen(data), data);
+        send(client, resp, strlen(resp), 0);
+        close(client);
+        free(resp);
+    }
+    return NULL;
 }
 
-func runInterval(ms int64, body func()) {
-	ticker := time.NewTicker(time.Duration(ms) * time.Millisecond)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for range ticker.C {
-			body()
-		}
-	}()
+void serve_html(int port, char* html) {
+    pthread_t t;
+    pthread_create(&t, NULL, http_server, html);
+}
+
+void connect_bot(const char* ip, int port, void (*cb)(void*)) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        cb(NULL);
+    } else {
+        printf("🤖 Bot failed to connect to %s:%d\n", ip, port);
+    }
+    close(sock);
+}
+
+typedef struct {
+    char* name;
+    void (*handler)(void*);
+} EventHandler;
+EventHandler handlers[512];
+int handlers_count = 0;
+pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void on_event(char* name, void (*h)(void*)) {
+    pthread_mutex_lock(&event_lock);
+    if(handlers_count < 512) {
+        handlers[handlers_count].name = name;
+        handlers[handlers_count++].handler = h;
+    }
+    pthread_mutex_unlock(&event_lock);
+}
+
+void emit_event(char* name) {
+    pthread_mutex_lock(&event_lock);
+    for(int i=0; i<handlers_count; i++) {
+        if(strcmp(handlers[i].name, name) == 0) {
+            schedule_task(rand() % NUM_WORKERS, handlers[i].handler, NULL);
+        }
+    }
+    pthread_mutex_unlock(&event_lock);
+}
+
+typedef struct {
+    int ms;
+    void (*func)(void*);
+} IntervalArg;
+
+void* interval_runner(void* arg) {
+    IntervalArg* ia = (IntervalArg*)arg;
+    while(1) {
+        usleep(ia->ms * 1000);
+        schedule_task(rand() % NUM_WORKERS, ia->func, NULL);
+    }
+    return NULL;
+}
+
+void start_interval(int ms, void (*func)(void*)) {
+    IntervalArg* arg = malloc(sizeof(IntervalArg));
+    arg->ms = ms;
+    arg->func = func;
+    pthread_t t;
+    pthread_create(&t, NULL, interval_runner, arg);
 }
 `)
 
-	sb.WriteString("\nfunc main() {\n")
+	// Scan for global variables first
 	for _, stmt := range program.Statements {
-		sb.WriteString(c.compileStatement(stmt, "\t"))
+		if as, ok := stmt.(*ast.AssignmentStatement); ok {
+			c.globalVars = append(c.globalVars, as.Name.Value)
+		}
 	}
-	sb.WriteString("\twg.Wait()\n")
+
+	for _, v := range c.globalVars {
+		sb.WriteString(fmt.Sprintf("char* %s;\n", v))
+	}
+
+	// Generated Functions (Lambdas)
+	var funcs strings.Builder
+
+	sb.WriteString("\n// Program Logic\n")
+
+	// Transpile main statements
+	var mainBody strings.Builder
+	for _, stmt := range program.Statements {
+		mainBody.WriteString(c.transpileStatement(stmt, &funcs))
+	}
+
+	sb.WriteString(funcs.String())
+
+	sb.WriteString("\nint main() {\n")
+	sb.WriteString("    srand(time(NULL));\n")
+	sb.WriteString("    for(int i=0; i<NUM_WORKERS; i++) {\n")
+	sb.WriteString("        int* id = malloc(sizeof(int)); *id = i;\n")
+	sb.WriteString("        pthread_mutex_init(&processors[i].lock, NULL);\n")
+	sb.WriteString("        pthread_create(&workers[i], NULL, worker_loop, id);\n")
+	sb.WriteString("    }\n")
+	sb.WriteString(mainBody.String())
+	sb.WriteString("    while(1) sleep(1);\n")
+	sb.WriteString("    return 0;\n")
 	sb.WriteString("}\n")
 
 	return sb.String()
 }
 
-func (c *Compiler) compileStatement(stmt ast.Statement, indent string) string {
+func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder) string {
 	switch s := stmt.(type) {
 	case *ast.AssignmentStatement:
-		op := ":="
-		if c.declaredVars[s.Name.Value] {
-			op = "="
-		} else {
-			c.declaredVars[s.Name.Value] = true
-		}
-		return fmt.Sprintf("%s%s %s %s\n", indent, s.Name.Value, op, c.compileExpression(s.Value))
+		val := c.transpileExpression(s.Value)
+		return fmt.Sprintf("    %s = %s;\n", s.Name.Value, val)
 	case *ast.ExpressionStatement:
-		return fmt.Sprintf("%s%s\n", indent, c.compileExpression(s.Expression))
+		return fmt.Sprintf("    %s;\n", c.transpileExpression(s.Expression))
 	case *ast.SpawnStatement:
-		switch s.Name.Value {
-		case "connect_bot":
-			return c.compileConnectBot(s, indent)
-		case "interval":
-			return c.compileInterval(s, indent)
-		case "on":
-			return c.compileOn(s, indent)
-		default:
-			return c.compileSpawn(s, indent)
+		fName := fmt.Sprintf("volt_func_%d", c.funcID)
+		c.funcID++
+		funcs.WriteString(fmt.Sprintf("void %s(void* arg) {\n", fName))
+		for _, bs := range s.Body.Statements {
+			funcs.WriteString("    " + c.transpileStatement(bs, funcs))
 		}
+		funcs.WriteString("}\n")
+
+		if s.Name.Value == "connect_bot" {
+			ip := c.transpileExpression(s.Args[0])
+			port := c.transpileExpression(s.Args[1])
+			return fmt.Sprintf("    connect_bot(%s, atoi(%s), %s);\n", ip, port, fName)
+		}
+		if s.Name.Value == "on" {
+			evt := c.transpileExpression(s.Args[0])
+			return fmt.Sprintf("    on_event(%s, %s);\n", evt, fName)
+		}
+		if s.Name.Value == "interval" {
+			ms := c.transpileExpression(s.Args[0])
+			return fmt.Sprintf("    start_interval(atoi(%s), %s);\n", ms, fName)
+		}
+
+		return fmt.Sprintf("    schedule_task(rand() %% NUM_WORKERS, %s, NULL);\n", fName)
 	}
 	return ""
 }
 
-func (c *Compiler) compileExpression(expr ast.Expression) string {
+func (c *Compiler) transpileExpression(expr ast.Expression) string {
 	switch e := expr.(type) {
 	case *ast.Identifier:
 		return e.Value
 	case *ast.IntegerLiteral:
-		return fmt.Sprintf("%d", e.Value)
+		return fmt.Sprintf("\"%d\"", e.Value)
 	case *ast.StringLiteral:
-		return fmt.Sprintf("%q", e.Value)
+		return fmt.Sprintf("\"%s\"", e.Value)
 	case *ast.InfixExpression:
-		return fmt.Sprintf("fmt.Sprintf(\"%%v%%v\", %s, %s)", c.compileExpression(e.Left), c.compileExpression(e.Right))
+		return fmt.Sprintf("dynamic_strcat(%s, %s)", c.transpileExpression(e.Left), c.transpileExpression(e.Right))
 	case *ast.CallExpression:
-		return c.compileCall(e)
+		name := ""
+		if ident, ok := e.Function.(*ast.Identifier); ok {
+			name = ident.Value
+		}
+		args := []string{}
+		for _, arg := range e.Arguments {
+			args = append(args, c.transpileExpression(arg))
+		}
+		switch name {
+		case "print":
+			return fmt.Sprintf("printf(\"%%s\\n\", %s)", args[0])
+		case "serve_html":
+			return fmt.Sprintf("serve_html(atoi(%s), %s)", args[0], args[1])
+		case "db_save":
+			return fmt.Sprintf("db_save(%s, %s)", args[0], args[1])
+		case "db_get":
+			return fmt.Sprintf("db_get(%s)", args[0])
+		case "fetch_api":
+			return fmt.Sprintf("fetch_api(%s)", args[0])
+		case "emit":
+			return fmt.Sprintf("emit_event(%s)", args[0])
+		case "file_write":
+			return fmt.Sprintf("file_write(%s, %s)", args[0], args[1])
+		}
 	}
-	return ""
-}
-
-func (c *Compiler) compileCall(e *ast.CallExpression) string {
-	name := ""
-	if ident, ok := e.Function.(*ast.Identifier); ok {
-		name = ident.Value
-	}
-
-	args := []string{}
-	for _, arg := range e.Arguments {
-		args = append(args, c.compileExpression(arg))
-	}
-
-	switch name {
-	case "print":
-		return fmt.Sprintf("fmt.Println(%s)", strings.Join(args, ", "))
-	case "db_save":
-		return fmt.Sprintf("dbSave(%s, %s)", args[0], args[1])
-	case "db_get":
-		return fmt.Sprintf("dbGet(%s)", args[0])
-	case "fetch_api":
-		return fmt.Sprintf("fetchAPI(%s)", args[0])
-	case "serve_html":
-		return fmt.Sprintf("serveHTML(%s, %s)", args[0], args[1])
-	case "file_write":
-		return fmt.Sprintf("fileWrite(%s, %s)", args[0], args[1])
-	case "emit":
-		return fmt.Sprintf("emitEvent(%s)", args[0])
-	}
-	return ""
-}
-
-func (c *Compiler) compileSpawn(s *ast.SpawnStatement, indent string) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%swg.Add(1)\n", indent))
-	sb.WriteString(fmt.Sprintf("%sgo func() {\n", indent))
-	sb.WriteString(fmt.Sprintf("%s\tdefer wg.Done()\n", indent))
-	for _, stmt := range s.Body.Statements {
-		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
-	}
-	sb.WriteString(fmt.Sprintf("%s}()\n", indent))
-	return sb.String()
-}
-
-func (c *Compiler) compileConnectBot(s *ast.SpawnStatement, indent string) string {
-	var sb strings.Builder
-	server := c.compileExpression(s.Args[0])
-	port := c.compileExpression(s.Args[1])
-
-	sb.WriteString(fmt.Sprintf("%sconnectBot(%s, %s, func() {\n", indent, server, port))
-	for _, stmt := range s.Body.Statements {
-		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
-	}
-	sb.WriteString(fmt.Sprintf("%s})\n", indent))
-	return sb.String()
-}
-
-func (c *Compiler) compileInterval(s *ast.SpawnStatement, indent string) string {
-	var sb strings.Builder
-	ms := c.compileExpression(s.Args[0])
-	sb.WriteString(fmt.Sprintf("%srunInterval(int64(%s), func() {\n", indent, ms))
-	for _, stmt := range s.Body.Statements {
-		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
-	}
-	sb.WriteString(fmt.Sprintf("%s})\n", indent))
-	return sb.String()
-}
-
-func (c *Compiler) compileOn(s *ast.SpawnStatement, indent string) string {
-	var sb strings.Builder
-	eventName := c.compileExpression(s.Args[0])
-	sb.WriteString(fmt.Sprintf("%sonEvent(%s, func() {\n", indent, eventName))
-	for _, stmt := range s.Body.Statements {
-		sb.WriteString(c.compileStatement(stmt, indent+"\t"))
-	}
-	sb.WriteString(fmt.Sprintf("%s})\n", indent))
-	return sb.String()
+	return "\"\""
 }

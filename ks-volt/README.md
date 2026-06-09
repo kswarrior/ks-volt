@@ -1,19 +1,17 @@
 # ⚡ KS-Volt
 
-KS-Volt is a high-performance, minimalist programming language designed for maximum concurrency, blazing fast development, and native Go performance. It features a clean syntax inspired by Python but leverages Go's powerful runtime for goroutines, networking, and more.
+KS-Volt is an ultra-high-performance, minimalist programming language designed for bare-metal speed and maximum concurrency. It features a clean syntax inspired by Python but compiles directly to **Static Native Machine Binaries** via a highly optimized C runtime.
 
 ## 🚀 Key Features
 
-- **True AOT Compilation**: Compiles `.kv` files directly into standalone machine binaries.
-- **Simpler than Python**: No variable keywords like `let` or `var`. Minimalist block syntax.
-- **Blazing Fast**: Instant compilation and native execution performance.
-- **Maximum Concurrency**: Exposes Go's native goroutines via the `spawn` keyword.
-- **Built-in Web Engine**: Effortlessly serve HTML and interact with APIs.
-- **Embedded Local Database**: Persistent, thread-safe key-value storage out of the box.
+- **True AOT Compilation**: Compiles `.kv` files into standalone, statically linked binaries with ZERO runtime dependencies.
+- **GMP-Style Work-Stealing Scheduler**: Custom Go-style non-blocking scheduler implemented in C for optimal multi-core utilization.
+- **Sub-Megabyte Memory Footprint**: Aggressive memory management and OS-level release (malloc_trim) targeting sub-1MB idle RAM usage.
+- **Blazing Fast**: Native execution speed with GCC -O3 optimizations.
+- **Maximum Concurrency**: Lightweight tasks (`spawn`) mapped to hardware threads via worker rings.
+- **Built-in Web Engine**: High-performance static socket-based web server.
+- **Embedded Local Database**: Persistent key-value storage.
 - **Raw Networking**: Native support for socket connections and bot streaming.
-- **Timing Primitives**: Node.js-style intervals for recurring tasks.
-- **Global Event System**: Asynchronous event-driven architecture (on/emit).
-- **File I/O**: Seamless raw file writing to disk.
 
 ## 🛠️ Language Syntax
 
@@ -25,7 +23,7 @@ STATUS = "ACTIVE"
 ```
 
 ### Concurrency with `spawn`
-Execute any block of code in a native Go goroutine.
+Execute any block of code in a lightweight task managed by the work-stealing scheduler.
 ```kv
 spawn start_service() {
     print("Service is running...")
@@ -33,7 +31,7 @@ spawn start_service() {
 ```
 
 ### String Interpolation
-Dynamic string concatenation using the `+` operator.
+Dynamic string concatenation using the `+` operator (mapped to `dynamic_strcat`).
 ```kv
 print("⚡ Server spinning up on port: " + PORT)
 ```
@@ -53,52 +51,31 @@ spawn connect_bot("127.0.0.1", 25565) {
 }
 ```
 
-### Intervals
-Recurring tasks using the `interval` keyword.
-```kv
-spawn timer() {
-    interval(1000) {
-        print("One second passed")
-    }
-}
-```
-
-### Event System
-Decouple logic using global events.
-```kv
-on("alert") {
-    print("⚠️ ALERT RECEIVED")
-}
-
-emit("alert")
-```
-
-### File I/O
-Write data directly to files.
-```kv
-file_write("log.txt", "Operation successful")
-```
-
 ## 📈 Performance & Load
 
-KS-Volt is built on top of the Go standard library, inheriting its world-class performance:
-- **Concurrency**: Can easily handle tens of thousands of concurrent `spawn` blocks (goroutines).
-- **Compilation**: Near-instant execution.
-- **Networking**: High-throughput `net/http` and `net` stack exposure.
-- **Memory**: Efficient memory management with Go's garbage collector.
+KS-Volt is built for extreme efficiency:
+- **Low Latency**: Direct hardware thread mapping.
+- **Memory**: Drastic reduction in idle RAM compared to Go/Node.js.
+- **Compilation**: Fast AOT compilation via the KS-Volt toolchain.
 
 ## 🏁 Getting Started
 
-To compile a KS-Volt script (`.kv` file):
+### Prerequisites
+- Go (for the compiler frontend)
+- GCC (for the AOT backend)
+
+### Compilation
+To compile a KS-Volt script (`.kv` file) to a static native binary:
 
 ```bash
 go run main.go path/to/your_script.kv
 ```
 
-This will generate a standalone binary (e.g., `test`) that you can execute directly:
+### Execution
+Run the generated standalone binary directly:
 
 ```bash
-./test
+./your_script
 ```
 
 ## 📂 Project Structure
@@ -107,5 +84,5 @@ This will generate a standalone binary (e.g., `test`) that you can execute direc
 - `lexer/`: Stateful scanner.
 - `ast/`: Abstract Syntax Tree nodes.
 - `parser/`: Recursive descent parser.
-- `compiler/`: AOT Transpiler logic.
-- `main.go`: CLI entry point and build orchestrator.
+- `compiler/`: C-Targeted AOT Transpiler and Work-Stealing Scheduler.
+- `main.go`: CLI entry point and GCC build orchestrator.

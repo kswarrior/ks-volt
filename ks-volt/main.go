@@ -34,30 +34,29 @@ func main() {
 	}
 
 	c := compiler.New()
-	goCode := c.Compile(program)
+	cCode := c.Compile(program)
 
-	// Use a filename that doesn't start with a dot to avoid "no Go files" errors
-	// in some environments when running go build on a single file.
-	tempFile := "compiled_volt_tmp.go"
-	err = os.WriteFile(tempFile, []byte(goCode), 0644)
+	tempFile := "compiled_volt_tmp.c"
+	err = os.WriteFile(tempFile, []byte(cCode), 0644)
 	if err != nil {
-		fmt.Printf("Error writing temporary Go file: %s\n", err)
+		fmt.Printf("Error writing temporary C file: %s\n", err)
 		os.Exit(1)
 	}
 	defer os.Remove(tempFile)
 
 	outputBinary := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 
-	cmd := exec.Command("go", "build", "-o", outputBinary, tempFile)
+	// GCC Orchestration: O3 optimization, pthread for concurrency, static linking, strip symbols
+	cmd := exec.Command("gcc", "-O3", "-pthread", "-static", "-s", "-w", tempFile, "-o", outputBinary)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
-		fmt.Printf("Error compiling KS-Volt script: %s\n", err)
+		fmt.Printf("Error compiling KS-Volt script via GCC: %s\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Successfully compiled %s to %s\n", filename, outputBinary)
+	fmt.Printf("Successfully compiled %s to STATIC NATIVE BINARY: %s\n", filename, outputBinary)
 }
 
 func printParserErrors(errors []string) {
