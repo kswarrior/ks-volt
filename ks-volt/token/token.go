@@ -32,13 +32,19 @@ const (
 	PRINT      = "PRINT"
 	SERVE_HTML = "SERVE_HTML"
 	FETCH_API  = "FETCH_API"
+	DB_SAVE    = "DB_SAVE"
+	DB_GET     = "DB_GET"
+	CONNECT_BOT = "CONNECT_BOT"
 )
 
 var keywords = map[string]TokenType{
-	"spawn":      SPAWN,
-	"print":      PRINT,
-	"serve_html": SERVE_HTML,
-	"fetch_api":  FETCH_API,
+	"spawn":       SPAWN,
+	"print":       PRINT,
+	"serve_html":  SERVE_HTML,
+	"fetch_api":   FETCH_API,
+	"db_save":     DB_SAVE,
+	"db_get":      DB_GET,
+	"connect_bot": CONNECT_BOT,
 }
 
 func LookupIdent(ident string) TokenType {

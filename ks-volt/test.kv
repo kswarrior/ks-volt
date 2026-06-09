@@ -1,12 +1,19 @@
 PORT = 8080
-API_URL = "https://worldtimeapi.org/api/timezone/Etc/UTC"
+STATUS = "ACTIVE"
 
+// Pillar A: Dynamic UI & Strings
 spawn start_web_ui(PORT) {
-    print("⚡ KS-Volt Web UI server is spinning up on port: " + PORT)
+    print("⚡ KS-Volt Web UI spinning up on port: " + PORT)
+    serve_html(PORT, "<h1>Status: " + STATUS + "</h1>")
+}
 
-    // Fetch some dynamic data
-    data = fetch_api(API_URL)
-    print("Fetched dynamic data: " + data)
+// Pillar B: Embedded Local Database
+db_save("bot_state", "ready")
+current_state = db_get("bot_state")
+print("Data bank state is: " + current_state)
 
-    serve_html(PORT, "<h1>Hello World from KS-Volt!</h1><p>Data from API: " + data + "</p>")
+// Pillar C: Raw Network Connection (Minecraft Bots/Sockets)
+SERVER = "127.0.0.1"
+spawn connect_bot(SERVER, 25565) {
+    print("🤖 Bot successfully streamed connection to " + SERVER)
 }

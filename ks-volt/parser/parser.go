@@ -11,7 +11,7 @@ import (
 const (
 	_ int = iota
 	LOWEST
-	SUM // +
+	SUM  // +
 	CALL // function(args)
 )
 
@@ -63,14 +63,12 @@ func (p *Parser) ParseProgram() *ast.Program {
 
 func (p *Parser) parseStatement() ast.Statement {
 	switch p.curToken.Type {
-	case token.SPAWN:
+	case token.SPAWN, token.CONNECT_BOT:
 		return p.parseSpawnStatement()
 	case token.IDENT:
 		if p.peekToken.Type == token.ASSIGN {
 			return p.parseAssignmentStatement()
 		}
-		return p.parseExpressionStatement()
-	case token.PRINT, token.SERVE_HTML, token.FETCH_API:
 		return p.parseExpressionStatement()
 	default:
 		return p.parseExpressionStatement()
@@ -80,11 +78,16 @@ func (p *Parser) parseStatement() ast.Statement {
 func (p *Parser) parseSpawnStatement() *ast.SpawnStatement {
 	stmt := &ast.SpawnStatement{Token: p.curToken}
 
-	if !p.expectPeek(token.IDENT) {
+	if p.peekToken.Type == token.LPAREN {
+		// handle anonymous spawn or builtin block like connect_bot(...) { ... }
+		stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	} else if p.peekToken.Type == token.IDENT || p.peekToken.Type == token.CONNECT_BOT {
+		p.nextToken()
+		stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	} else {
+		p.peekError(token.IDENT)
 		return nil
 	}
-
-	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 
 	if !p.expectPeek(token.LPAREN) {
 		return nil
@@ -156,6 +159,12 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 	case token.SERVE_HTML:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	case token.FETCH_API:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.DB_SAVE:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.DB_GET:
+		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	case token.CONNECT_BOT:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
 		return nil
