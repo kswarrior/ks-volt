@@ -4,8 +4,9 @@ KS-Volt is a high-performance, minimalist programming language designed for maxi
 
 ## 🚀 Key Features
 
+- **True AOT Compilation**: Compiles `.kv` files directly into standalone machine binaries.
 - **Simpler than Python**: No variable keywords like `let` or `var`. Minimalist block syntax.
-- **Blazing Fast**: Instant compilation and execution. Native Go performance under the hood.
+- **Blazing Fast**: Instant compilation and native execution performance.
 - **Maximum Concurrency**: Exposes Go's native goroutines via the `spawn` keyword.
 - **Built-in Web Engine**: Effortlessly serve HTML and interact with APIs.
 - **Embedded Local Database**: Persistent, thread-safe key-value storage out of the box.
@@ -59,10 +60,16 @@ KS-Volt is built on top of the Go standard library, inheriting its world-class p
 
 ## 🏁 Getting Started
 
-To run a KS-Volt script (`.kv` file):
+To compile a KS-Volt script (`.kv` file):
 
 ```bash
 go run main.go path/to/your_script.kv
+```
+
+This will generate a standalone binary (e.g., `test`) that you can execute directly:
+
+```bash
+./test
 ```
 
 ## 📂 Project Structure
@@ -71,5 +78,5 @@ go run main.go path/to/your_script.kv
 - `lexer/`: Stateful scanner.
 - `ast/`: Abstract Syntax Tree nodes.
 - `parser/`: Recursive descent parser.
-- `evaluator/`: Execution runtime.
-- `main.go`: CLI entry point.
+- `compiler/`: AOT Transpiler logic.
+- `main.go`: CLI entry point and build orchestrator.
