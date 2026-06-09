@@ -1,0 +1,5 @@
+PORT = 8080
+spawn start_web_ui(PORT) {
+    print("⚡ KS-Volt Web UI server is spinning up...")
+    serve_html(PORT, "<h1>Hello World from KS-Volt!</h1>")
+}
