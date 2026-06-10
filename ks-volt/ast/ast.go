@@ -56,6 +56,36 @@ type ReturnStatement struct {
 func (rs *ReturnStatement) statementNode()       {}
 func (rs *ReturnStatement) TokenLiteral() string { return rs.Token.Literal }
 
+type IfStatement struct {
+	Token       token.Token // if
+	Condition   Expression
+	Consequence *BlockStatement
+	Alternative *BlockStatement
+}
+
+func (is *IfStatement) statementNode()       {}
+func (is *IfStatement) TokenLiteral() string { return is.Token.Literal }
+
+type LoopStatement struct {
+	Token    token.Token // loop
+	Variable *Identifier
+	Iterable Expression
+	Body     *BlockStatement
+}
+
+func (ls *LoopStatement) statementNode()       {}
+func (ls *LoopStatement) TokenLiteral() string { return ls.Token.Literal }
+
+type TryCatchStatement struct {
+	Token         token.Token // try
+	TryBody       *BlockStatement
+	CatchVariable *Identifier
+	CatchBody     *BlockStatement
+}
+
+func (ts *TryCatchStatement) statementNode()       {}
+func (ts *TryCatchStatement) TokenLiteral() string { return ts.Token.Literal }
+
 type ExpressionStatement struct {
 	Token      token.Token
 	Expression Expression
@@ -81,26 +111,6 @@ type SpawnStatement struct {
 
 func (ss *SpawnStatement) statementNode()       {}
 func (ss *SpawnStatement) TokenLiteral() string { return ss.Token.Literal }
-
-type LoopStatement struct {
-	Token    token.Token
-	Variable *Identifier
-	Iterable Expression
-	Body     *BlockStatement
-}
-
-func (ls *LoopStatement) statementNode()       {}
-func (ls *LoopStatement) TokenLiteral() string { return ls.Token.Literal }
-
-type TryCatchStatement struct {
-	Token         token.Token
-	TryBody       *BlockStatement
-	CatchVariable *Identifier
-	CatchBody     *BlockStatement
-}
-
-func (ts *TryCatchStatement) statementNode()       {}
-func (ts *TryCatchStatement) TokenLiteral() string { return ts.Token.Literal }
 
 type Identifier struct {
 	Token token.Token
@@ -135,7 +145,7 @@ func (b *Boolean) expressionNode()      {}
 func (b *Boolean) TokenLiteral() string { return b.Token.Literal }
 
 type ArrayLiteral struct {
-	Token    token.Token
+	Token    token.Token // [
 	Elements []Expression
 }
 
@@ -171,18 +181,8 @@ type MethodCallExpression struct {
 func (mce *MethodCallExpression) expressionNode()      {}
 func (mce *MethodCallExpression) TokenLiteral() string { return mce.Token.Literal }
 
-type IfExpression struct {
-	Token       token.Token
-	Condition   Expression
-	Consequence *BlockStatement
-	Alternative *BlockStatement
-}
-
-func (ie *IfExpression) expressionNode()      {}
-func (ie *IfExpression) TokenLiteral() string { return ie.Token.Literal }
-
 type IndexExpression struct {
-	Token token.Token
+	Token token.Token // [
 	Left  Expression
 	Index Expression
 }

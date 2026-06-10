@@ -63,6 +63,8 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parseLoopStatement()
 	case token.TRY:
 		return p.parseTryCatchStatement()
+	case token.IF:
+		return p.parseIfStatement()
 	case token.FN:
 		return p.parseFunctionStatement()
 	case token.RETURN:
@@ -109,6 +111,22 @@ func (p *Parser) parseReturnStatement() *ast.ReturnStatement {
 	stmt := &ast.ReturnStatement{Token: p.curToken}
 	p.nextToken()
 	stmt.ReturnValue = p.parseExpression(LOWEST)
+	return stmt
+}
+
+func (p *Parser) parseIfStatement() *ast.IfStatement {
+	stmt := &ast.IfStatement{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) { return nil }
+	p.nextToken()
+	stmt.Condition = p.parseExpression(LOWEST)
+	if !p.expectPeek(token.RPAREN) { return nil }
+	if !p.expectPeek(token.LBRACE) { return nil }
+	stmt.Consequence = p.parseBlockStatement()
+	if p.peekToken.Type == token.ELSE {
+		p.nextToken()
+		if !p.expectPeek(token.LBRACE) { return nil }
+		stmt.Alternative = p.parseBlockStatement()
+	}
 	return stmt
 }
 
@@ -197,8 +215,6 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 		leftExp = &ast.Boolean{Token: p.curToken, Value: p.curToken.Type == token.TRUE}
 	case token.LBRACKET:
 		leftExp = p.parseArrayLiteral()
-	case token.IF:
-		leftExp = p.parseIfExpression()
 	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
@@ -265,22 +281,6 @@ func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
 	p.nextToken()
 	exp.Index = p.parseExpression(LOWEST)
 	if !p.expectPeek(token.RBRACKET) { return nil }
-	return exp
-}
-
-func (p *Parser) parseIfExpression() ast.Expression {
-	exp := &ast.IfExpression{Token: p.curToken}
-	if !p.expectPeek(token.LPAREN) { return nil }
-	p.nextToken()
-	exp.Condition = p.parseExpression(LOWEST)
-	if !p.expectPeek(token.RPAREN) { return nil }
-	if !p.expectPeek(token.LBRACE) { return nil }
-	exp.Consequence = p.parseBlockStatement()
-	if p.peekToken.Type == token.ELSE {
-		p.nextToken()
-		if !p.expectPeek(token.LBRACE) { return nil }
-		exp.Alternative = p.parseBlockStatement()
-	}
 	return exp
 }
 

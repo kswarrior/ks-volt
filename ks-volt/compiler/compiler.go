@@ -20,7 +20,7 @@ func New() *Compiler {
 func (c *Compiler) Compile(program *ast.Program) string {
 	var sb strings.Builder
 
-	// C Header, GMP Scheduler, and Definitive Runtime
+	// Definitive C Header, GMP Scheduler, and Unmanaged Runtime
 	sb.WriteString(`#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +37,7 @@ func (c *Compiler) Compile(program *ast.Program) string {
 #include <stdbool.h>
 #include <ctype.h>
 
-#define MAX_TASKS 4096
+#define MAX_TASKS 8192
 #define NUM_WORKERS 4
 
 typedef enum { TYPE_STR, TYPE_INT, TYPE_BOOL, TYPE_ARRAY, TYPE_MAP, TYPE_FN } VoltType;
@@ -72,6 +72,7 @@ Processor processors[NUM_WORKERS];
 pthread_t workers[NUM_WORKERS];
 __thread int worker_id;
 __thread jmp_buf* current_jmp_env;
+pthread_mutex_t db_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void schedule_task(int p_id, void (*func)(void*), void* arg) {
     Processor* p = &processors[p_id];
@@ -116,6 +117,7 @@ void* worker_loop(void* arg) {
     return NULL;
 }
 
+// Runtime Primitives
 VoltValue* make_str(const char* s) {
     VoltValue* v = malloc(sizeof(VoltValue));
     v->type = TYPE_STR; v->s = strdup(s); return v;
@@ -136,9 +138,10 @@ VoltValue* make_fn(VoltFn f) {
 char* to_str(VoltValue* v) {
     if (!v) return "";
     if (v->type == TYPE_STR) return v->s;
-    char* buf = malloc(64);
+    char* buf = malloc(128);
     if (v->type == TYPE_INT) sprintf(buf, "%lld", v->i);
     else if (v->type == TYPE_BOOL) sprintf(buf, "%s", v->b ? "true" : "false");
+    else if (v->type == TYPE_FN) sprintf(buf, "[function]");
     else return "complex";
     return buf;
 }
@@ -147,7 +150,7 @@ VoltValue* dynamic_add(VoltValue* a, VoltValue* b) {
     char* s1 = to_str(a); char* s2 = to_str(b);
     char* res = malloc(strlen(s1) + strlen(s2) + 1);
     strcpy(res, s1); strcat(res, s2);
-    return make_str(res);
+    VoltValue* rv = make_str(res); free(res); return rv;
 }
 
 VoltValue* str_trim(VoltValue* v) {
@@ -171,11 +174,11 @@ VoltValue* str_upper(VoltValue* v) {
 VoltValue* json_parse(const char* json) {
     VoltValue* m = malloc(sizeof(VoltValue));
     m->type = TYPE_MAP; m->m.len = 0;
-    m->m.keys = malloc(10 * sizeof(char*));
-    m->m.values = malloc(10 * sizeof(VoltValue*));
+    m->m.keys = malloc(20 * sizeof(char*));
+    m->m.values = malloc(20 * sizeof(VoltValue*));
     char* s = strdup(json);
     char* p = strtok(s, "{}\",: ");
-    while(p && m->m.len < 10) {
+    while(p && m->m.len < 20) {
         m->m.keys[m->m.len] = strdup(p);
         p = strtok(NULL, "{}\",: ");
         if (p) {
@@ -197,20 +200,36 @@ VoltValue* map_get(VoltValue* m, const char* key) {
 }
 
 void db_save(const char* key, const char* val) {
+    pthread_mutex_lock(&db_file_lock);
     FILE* f = fopen("volt_db.json", "a");
     if(f) { fprintf(f, "%s:%s\n", key, val); fclose(f); }
+    pthread_mutex_unlock(&db_file_lock);
 }
 
 VoltValue* db_get(const char* key) { return make_str("ready"); }
 
 void volt_file_write(const char* fn, const char* data) {
+    pthread_mutex_lock(&db_file_lock);
     FILE* f = fopen(fn, "w");
-    if (!f) { if (current_jmp_env) longjmp(*current_jmp_env, 1); return; }
+    if (!f) { pthread_mutex_unlock(&db_file_lock); if (current_jmp_env) longjmp(*current_jmp_env, 1); return; }
     fputs(data, f); fclose(f);
+    pthread_mutex_unlock(&db_file_lock);
 }
 
 void connect_bot(const char* ip, int port, void (*cb)(void*)) {
-    cb(NULL);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+    struct timeval tv = {2, 0};
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        cb(NULL);
+    } else {
+        cb(NULL);
+    }
+    close(sock);
 }
 
 typedef struct { int ms; void (*func)(void*); } IntervalArg;
@@ -271,14 +290,15 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			walker(n.TryBody)
 			c.globalVars[n.CatchVariable.Value] = true
 			walker(n.CatchBody)
-		case *ast.SpawnStatement:
-			walker(n.Body)
-		case *ast.IfExpression:
+		case *ast.IfStatement:
 			walker(n.Consequence)
 			if n.Alternative != nil { walker(n.Alternative) }
+		case *ast.SpawnStatement:
+			walker(n.Body)
 		case *ast.InfixExpression:
 			walker(n.Left); walker(n.Right)
 		case *ast.CallExpression:
+			walker(n.Function)
 			for _, a := range n.Arguments { walker(a) }
 		case *ast.IndexExpression:
 			walker(n.Left); walker(n.Index)
@@ -301,8 +321,6 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return indent + s.Name.Value + " = " + c.transpileExpression(s.Value) + ";\n"
 	case *ast.FunctionStatement:
 		fName := "volt_fn_" + s.Name.Value
-		params := []string{}
-		for _, p := range s.Parameters { params = append(params, "VoltValue* "+p.Value) }
 		funcs.WriteString("VoltValue* " + fName + "_impl(int argc, VoltValue** argv) {\n")
 		for i, p := range s.Parameters {
 			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
@@ -314,6 +332,19 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return indent + s.Name.Value + " = make_fn(" + fName + "_impl);\n"
 	case *ast.ReturnStatement:
 		return indent + "return " + c.transpileExpression(s.ReturnValue) + ";\n"
+	case *ast.IfStatement:
+		cond := c.transpileExpression(s.Condition)
+		var cons strings.Builder
+		for _, st := range s.Consequence.Statements { cons.WriteString(c.transpileStatement(st, funcs, indent+"    ")) }
+		var alt strings.Builder
+		if s.Alternative != nil {
+			for _, st := range s.Alternative.Statements { alt.WriteString(c.transpileStatement(st, funcs, indent+"    ")) }
+		}
+		res := indent + "if (" + cond + "->b) {\n" + cons.String() + indent + "}"
+		if s.Alternative != nil {
+			res += " else {\n" + alt.String() + indent + "}"
+		}
+		return res + "\n"
 	case *ast.ExpressionStatement:
 		return indent + c.transpileExpression(s.Expression) + ";\n"
 	case *ast.LoopStatement:
@@ -377,15 +408,6 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 		case "trim": return "str_trim(" + obj + ")"
 		case "upper": return "str_upper(" + obj + ")"
 		}
-	case *ast.IfExpression:
-		cond := c.transpileExpression(e.Condition)
-		cons := ""
-		for _, st := range e.Consequence.Statements { cons += strings.TrimSpace(c.transpileStatement(st, &strings.Builder{}, "")) + ";" }
-		alt := ""
-		if e.Alternative != nil {
-			for _, st := range e.Alternative.Statements { alt += strings.TrimSpace(c.transpileStatement(st, &strings.Builder{}, "")) + ";" }
-		}
-		return "((" + cond + "->b) ? ({ " + cons + "; make_bool(true); }) : ({ " + alt + "; make_bool(false); }))"
 	case *ast.CallExpression:
 		nameIdent, ok := e.Function.(*ast.Identifier)
 		if !ok {
