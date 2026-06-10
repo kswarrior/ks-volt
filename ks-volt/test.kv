@@ -1,22 +1,43 @@
 PORT = 8080
-LOG_FILE = "bot_log.txt"
+STATUS = "ACTIVE"
+IS_SECURE = true
 
-// Event listener for heartbeats
-on("heartbeat") {
-    print("💓 Heartbeat event received!")
-    file_write(LOG_FILE, "Heartbeat at " + "now") // Simplified timestamp
+// Module A: Conditionals & Control Flow
+// Note: In C AOT, literals are evaluated as truthy
+if (IS_SECURE) {
+    print("🔓 Running compiler in high-security isolation mode.")
+} else {
+    print("⚠️ Warning: Running without security layers.")
 }
 
-spawn start_services() {
-    print("🚀 Services starting...")
+// Module B: Core Timing, Intervals & Database Integration
+spawn interval(5000) {
+    print("⏳ Running background system check on telemetry status...")
+    db_save("bot_state", "ready")
 
-    // Emit heartbeat every 2 seconds
-    interval(2000) {
-        print("⏲️ Triggering heartbeat...")
-        emit("heartbeat")
+    current_state = db_get("bot_state")
+    print("Data bank verified state: " + current_state)
+}
+
+// Module C: Unmanaged Contiguous Arrays & Vector Loops
+target_ports = [25565, 25566, 25567]
+print("Targeting primary bot infrastructure port: " + target_ports[0])
+
+loop port in target_ports {
+    spawn connect_bot("127.0.0.1", port) {
+        print("🤖 Network worker attached to port stream: " + port)
     }
 }
 
-spawn web_server(PORT) {
-    serve_html(PORT, "<h1>KS-Volt Live Dashboard</h1>")
+// Module D: Zero-Allocation JSON Object Manipulation
+payload = "{\"status\": \"ACTIVE\", \"players\": 12}"
+data_map = json_parse(payload)
+print("Live telemetry status read: " + data_map["status"])
+
+// Module E: Zero-Overhead Exception Guardrails
+try {
+    file_write("system.log", "Port active allocation: " + PORT)
+    print("✅ System log written successfully.")
+} catch (error) {
+    print("❌ Trapped OS Execution Exception: " + error)
 }
