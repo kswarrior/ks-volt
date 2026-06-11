@@ -1,19 +1,30 @@
 package compiler
 
 import (
+	"fmt"
 	"ks-volt/ast"
+	"ks-volt/lexer"
+	"ks-volt/parser"
+	"ks-volt/token"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 )
 
 type Compiler struct {
-	globalVars map[string]bool
-	funcID     int
+	globalVars       map[string]bool
+	funcID           int
+	LinkLibs     []string
+	PythonNeeded bool
+	ComponentAliases map[string]string
+	curComponent     string
 }
 
 func New() *Compiler {
 	return &Compiler{
-		globalVars: make(map[string]bool),
+		globalVars:       make(map[string]bool),
+		ComponentAliases: make(map[string]string),
 	}
 }
 
@@ -36,6 +47,8 @@ func (c *Compiler) Compile(program *ast.Program) string {
 #include <setjmp.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
 #define MAX_TASKS 8192
 #define NUM_WORKERS 4
@@ -44,6 +57,29 @@ typedef enum { TYPE_STR, TYPE_INT, TYPE_BOOL, TYPE_ARRAY, TYPE_MAP, TYPE_FN } Vo
 
 struct VoltValue;
 typedef struct VoltValue* (*VoltFn)(int, struct VoltValue**);
+
+typedef struct VoltBuffer {
+    char* data;
+    size_t len;
+    size_t cap;
+} VoltBuffer;
+
+VoltBuffer* volt_buf_new() {
+    VoltBuffer* b = malloc(sizeof(VoltBuffer));
+    b->cap = 4096; b->len = 0; b->data = malloc(b->cap);
+    b->data[0] = '\0';
+    return b;
+}
+
+void volt_buf_append(VoltBuffer* b, const char* s) {
+    if (!b || !s) return;
+    size_t slen = strlen(s);
+    if (b->len + slen + 1 > b->cap) {
+        b->cap = (b->len + slen + 1) * 2;
+        b->data = realloc(b->data, b->cap);
+    }
+    strcpy(b->data + b->len, s); b->len += slen;
+}
 
 typedef struct VoltValue {
     VoltType type;
@@ -120,7 +156,7 @@ void* worker_loop(void* arg) {
 // Runtime Primitives
 VoltValue* make_str(const char* s) {
     VoltValue* v = malloc(sizeof(VoltValue));
-    v->type = TYPE_STR; v->s = strdup(s); return v;
+    v->type = TYPE_STR; v->s = strdup(s ? s : ""); return v;
 }
 VoltValue* make_int(long long i) {
     VoltValue* v = malloc(sizeof(VoltValue));
@@ -241,6 +277,29 @@ void start_interval(int ms, void (*func)(void*)) {
     IntervalArg* arg = malloc(sizeof(IntervalArg)); arg->ms = ms; arg->func = func;
     pthread_t t; pthread_create(&t, NULL, interval_runner, arg);
 }
+
+// FS Shortcuts
+void fs_rm(const char* path) { unlink(path); }
+void fs_mv(const char* src, const char* dst) { rename(src, dst); }
+void fs_touch(const char* path) { FILE* f = fopen(path, "a"); if(f) fclose(f); }
+void fs_cat(const char* path) {
+    FILE* f = fopen(path, "r");
+    if(!f) return;
+    char buf[4096];
+    size_t n;
+    while((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
+    fclose(f);
+}
+void fs_cp(const char* src, const char* dst) {
+    FILE* s = fopen(src, "rb");
+    if(!s) return;
+    FILE* d = fopen(dst, "wb");
+    if(!d) { fclose(s); return; }
+    char buf[8192];
+    size_t n;
+    while((n = fread(buf, 1, sizeof(buf), s)) > 0) fwrite(buf, 1, n, d);
+    fclose(s); fclose(d);
+}
 `)
 
 	c.collectGlobalVars(program)
@@ -254,8 +313,14 @@ void start_interval(int ms, void (*func)(void*)) {
 		mainBody.WriteString(c.transpileStatement(stmt, &funcs, "    "))
 	}
 
+	if c.PythonNeeded {
+		sb.WriteString("#include <Python.h>\n")
+	}
+	sb.WriteString("#include \"deps/quickjs.h\"\n")
+	sb.WriteString("#include \"deps/quickjs-libc.h\"\n")
+
 	sb.WriteString(funcs.String())
-	sb.WriteString("\nint main() {\n")
+	sb.WriteString("\nint main(int argc, char** argv) {\n")
 	sb.WriteString("    srand(time(NULL));\n")
 	sb.WriteString("    for(int i=0; i<NUM_WORKERS; i++) {\n")
 	sb.WriteString("        int* id = malloc(sizeof(int)); *id = i;\n")
@@ -271,10 +336,14 @@ void start_interval(int ms, void (*func)(void*)) {
 func (c *Compiler) collectGlobalVars(program *ast.Program) {
 	var walker func(node interface{})
 	walker = func(node interface{}) {
-		if node == nil { return }
+		if node == nil {
+			return
+		}
 		switch n := node.(type) {
 		case *ast.Program:
-			for _, s := range n.Statements { walker(s) }
+			for _, s := range n.Statements {
+				walker(s)
+			}
 		case *ast.AssignmentStatement:
 			c.globalVars[n.Name.Value] = true
 			walker(n.Value)
@@ -282,7 +351,9 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			c.globalVars[n.Name.Value] = true
 			walker(n.Body)
 		case *ast.BlockStatement:
-			for _, s := range n.Statements { walker(s) }
+			for _, s := range n.Statements {
+				walker(s)
+			}
 		case *ast.LoopStatement:
 			c.globalVars[n.Variable.Value] = true
 			walker(n.Body)
@@ -292,31 +363,166 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			walker(n.CatchBody)
 		case *ast.IfStatement:
 			walker(n.Consequence)
-			if n.Alternative != nil { walker(n.Alternative) }
+			if n.Alternative != nil {
+				walker(n.Alternative)
+			}
 		case *ast.SpawnStatement:
 			walker(n.Body)
 		case *ast.InfixExpression:
-			walker(n.Left); walker(n.Right)
+			walker(n.Left)
+			walker(n.Right)
 		case *ast.CallExpression:
 			walker(n.Function)
-			for _, a := range n.Arguments { walker(a) }
+			for _, a := range n.Arguments {
+				walker(a)
+			}
 		case *ast.IndexExpression:
-			walker(n.Left); walker(n.Index)
+			walker(n.Left)
+			walker(n.Index)
 		case *ast.ArrayLiteral:
-			for _, e := range n.Elements { walker(e) }
+			for _, e := range n.Elements {
+				walker(e)
+			}
 		case *ast.ExpressionStatement:
 			walker(n.Expression)
 		case *ast.MethodCallExpression:
 			walker(n.Object)
-			for _, a := range n.Arguments { walker(a) }
+			for _, a := range n.Arguments {
+				walker(a)
+			}
 		}
 	}
 	walker(program)
 }
 
 func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder, indent string) string {
-	if stmt == nil { return "" }
+	if stmt == nil {
+		return ""
+	}
 	switch s := stmt.(type) {
+	case *ast.FSMacroStatement:
+		args := []string{}
+		for _, arg := range s.Args {
+			args = append(args, "to_str("+c.transpileExpression(arg)+")")
+		}
+		switch s.Token.Type {
+		case token.FS_RM:
+			return indent + "fs_rm(" + args[0] + ");\n"
+		case token.FS_MV:
+			return indent + "fs_mv(" + args[0] + ", " + args[1] + ");\n"
+		case token.FS_CP:
+			return indent + "fs_cp(" + args[0] + ", " + args[1] + ");\n"
+		case token.FS_TOUCH:
+			return indent + "fs_touch(" + args[0] + ");\n"
+		case token.FS_CAT:
+			return indent + "fs_cat(" + args[0] + ");\n"
+		}
+		return ""
+	case *ast.PolyglotBlockStatement:
+		switch s.Token.Type {
+		case token.PY_BLOCK:
+			c.PythonNeeded = true
+			code := strings.ReplaceAll(s.Code, "\\", "\\\\")
+			code = strings.ReplaceAll(code, "\"", "\\\"")
+			code = strings.ReplaceAll(code, "\n", "\\n")
+			return indent + "{\n" +
+				indent + "    Py_Initialize();\n" +
+				indent + "    PyRun_SimpleString(\"" + code + "\");\n" +
+				indent + "    Py_Finalize();\n" +
+				indent + "}\n"
+		case token.JS_BLOCK:
+			code := strings.ReplaceAll(s.Code, "\\", "\\\\")
+			code = strings.ReplaceAll(code, "\"", "\\\"")
+			code = strings.ReplaceAll(code, "\n", "\\n")
+			return indent + "{\n" +
+				indent + "    JSRuntime *rt = JS_NewRuntime();\n" +
+				indent + "    JSContext *ctx = JS_NewContext(rt);\n" +
+				indent + "    js_std_add_helpers(ctx, 0, NULL);\n" +
+				indent + "    const char *js_code = \"" + code + "\";\n" +
+				indent + "    JS_Eval(ctx, js_code, strlen(js_code), \"volt.js\", JS_EVAL_TYPE_GLOBAL);\n" +
+				indent + "    JS_FreeContext(ctx);\n" +
+				indent + "    JS_FreeRuntime(rt);\n" +
+				indent + "}\n"
+		case token.GO_BLOCK:
+			goCode := "package main\nimport \"C\"\n" + s.Code + "\nfunc main() {}\n"
+			os.WriteFile("volt_bridge.go", []byte(goCode), 0644)
+			cmd := exec.Command("go", "build", "-buildmode=c-archive", "-o", "volt_go.a", "volt_bridge.go")
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("Go block compilation error: %v\n", err)
+			} else {
+				c.LinkLibs = append(c.LinkLibs, "volt_go.a")
+			}
+			return ""
+		case token.RUST_BLOCK:
+			rustCode := "#![allow(dead_code)]\n" + s.Code
+			os.MkdirAll("volt_rust/src", 0755)
+			os.WriteFile("volt_rust/src/lib.rs", []byte(rustCode), 0644)
+			cargoToml := "[package]\nname = \"volt_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"staticlib\"]\n"
+			os.WriteFile("volt_rust/Cargo.toml", []byte(cargoToml), 0644)
+			cmd := exec.Command("cargo", "build", "--release", "--manifest-path", "volt_rust/Cargo.toml")
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("Rust block compilation error: %v\n", err)
+			} else {
+				c.LinkLibs = append(c.LinkLibs, "volt_rust/target/release/libvolt_rust.a")
+			}
+			return ""
+		}
+		return ""
+	case *ast.ComponentDefinition:
+		oldComp := c.curComponent
+		c.curComponent = s.Name.Value
+		fName := "render_" + s.Name.Value
+		funcs.WriteString("void " + fName + "(VoltBuffer* ctx, int argc, VoltValue** argv) {\n")
+		for i, p := range s.Parameters {
+			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
+		}
+		for _, bs := range s.Body.Statements {
+			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
+		}
+		funcs.WriteString("}\n")
+		c.curComponent = oldComp
+		return ""
+	case *ast.ImportComponentStatement:
+		data, err := os.ReadFile(s.Path)
+		if err != nil {
+			fmt.Printf("Error importing component %s: %v\n", s.Path, err)
+			return ""
+		}
+		subL := lexer.New(string(data))
+		subP := parser.New(subL)
+		subProg := subP.ParseProgram()
+		if len(subP.Errors()) > 0 {
+			fmt.Printf("Parser errors in component %s:\n", s.Path)
+			for _, e := range subP.Errors() {
+				fmt.Printf("\t%s\n", e)
+			}
+		}
+		for _, subStmt := range subProg.Statements {
+			if cd, ok := subStmt.(*ast.ComponentDefinition); ok {
+				originalName := cd.Name.Value
+				cd.Name.Value = s.Alias.Value
+				c.ComponentAliases[s.Alias.Value] = cd.Name.Value
+				c.transpileStatement(cd, funcs, "")
+				cd.Name.Value = originalName
+			}
+		}
+		return ""
+	case *ast.WebBlockStatement:
+		name := s.Name
+		if name == "" {
+			name = "main_daemon"
+		}
+		funcs.WriteString("void volt_web_controller_" + name + "() {\n")
+		for _, bs := range s.Body.Statements {
+			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
+		}
+		funcs.WriteString("}\n")
+		return indent + "volt_web_controller_" + name + "();\n"
+	case *ast.PathStatement:
+		return indent + "// Mapping path: " + s.Path + "\n" +
+			indent + "{\n" +
+			c.transpileStatement(s.Body, funcs, indent+"    ") +
+			indent + "}\n"
 	case *ast.AssignmentStatement:
 		return indent + s.Name.Value + " = " + c.transpileExpression(s.Value) + ";\n"
 	case *ast.FunctionStatement:
@@ -335,10 +541,14 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 	case *ast.IfStatement:
 		cond := c.transpileExpression(s.Condition)
 		var cons strings.Builder
-		for _, st := range s.Consequence.Statements { cons.WriteString(c.transpileStatement(st, funcs, indent+"    ")) }
+		for _, st := range s.Consequence.Statements {
+			cons.WriteString(c.transpileStatement(st, funcs, indent+"    "))
+		}
 		var alt strings.Builder
 		if s.Alternative != nil {
-			for _, st := range s.Alternative.Statements { alt.WriteString(c.transpileStatement(st, funcs, indent+"    ")) }
+			for _, st := range s.Alternative.Statements {
+				alt.WriteString(c.transpileStatement(st, funcs, indent+"    "))
+			}
 		}
 		res := indent + "if (" + cond + "->b) {\n" + cons.String() + indent + "}"
 		if s.Alternative != nil {
@@ -346,18 +556,30 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		}
 		return res + "\n"
 	case *ast.ExpressionStatement:
+		if is, ok := s.Expression.(*ast.InterpolatedStringLiteral); ok && c.curComponent != "" {
+			res := ""
+			for _, seg := range is.Segments {
+				res += indent + "volt_buf_append(ctx, to_str(" + c.transpileExpression(seg) + "));\n"
+			}
+			return res
+		}
 		return indent + c.transpileExpression(s.Expression) + ";\n"
 	case *ast.LoopStatement:
 		it := c.transpileExpression(s.Iterable)
 		var body strings.Builder
-		for _, bs := range s.Body.Statements { body.WriteString(c.transpileStatement(bs, funcs, indent+"    ")) }
+		for _, bs := range s.Body.Statements {
+			body.WriteString(c.transpileStatement(bs, funcs, indent+"    "))
+		}
 		return indent + "for(int i=0; i<" + it + "->a.len; i++) {\n" +
 			indent + "    " + s.Variable.Value + " = " + it + "->a.elements[i];\n" +
 			body.String() + indent + "}\n"
 	case *ast.TryCatchStatement:
-		id := strconv.Itoa(c.funcID); c.funcID++
+		id := strconv.Itoa(c.funcID)
+		c.funcID++
 		funcs.WriteString("void volt_try_" + id + "(void* arg) {\n")
-		for _, ts := range s.TryBody.Statements { funcs.WriteString(c.transpileStatement(ts, funcs, "    ")) }
+		for _, ts := range s.TryBody.Statements {
+			funcs.WriteString(c.transpileStatement(ts, funcs, "    "))
+		}
 		funcs.WriteString("}\n")
 		return indent + "{ jmp_buf env_" + id + "; current_jmp_env = &env_" + id + ";\n" +
 			indent + "if (setjmp(env_" + id + ") == 0) {\n" +
@@ -366,9 +588,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			indent + "    " + s.CatchVariable.Value + " = make_str(\"OS Exception\");\n" +
 			c.transpileStatement(s.CatchBody, funcs, indent+"    ") + indent + "} }\n"
 	case *ast.SpawnStatement:
-		id := strconv.Itoa(c.funcID); c.funcID++
+		id := strconv.Itoa(c.funcID)
+		c.funcID++
 		funcs.WriteString("void volt_func_" + id + "(void* arg) {\n")
-		for _, bs := range s.Body.Statements { funcs.WriteString(c.transpileStatement(bs, funcs, "    ")) }
+		for _, bs := range s.Body.Statements {
+			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
+		}
 		funcs.WriteString("}\n")
 		if s.Name.Value == "connect_bot" {
 			return indent + "connect_bot(to_str(" + c.transpileExpression(s.Args[0]) + "), (int)" + c.transpileExpression(s.Args[1]) + "->i, volt_func_" + id + ");\n"
@@ -377,63 +602,144 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			return indent + "start_interval((int)" + c.transpileExpression(s.Args[0]) + "->i, volt_func_" + id + ");\n"
 		}
 		return indent + "schedule_task(rand() % NUM_WORKERS, volt_func_" + id + ", NULL);\n"
+	case *ast.BeforeEachStatement:
+		return indent + "// Middleware block\n" +
+			indent + "{\n" +
+			c.transpileStatement(s.Body, funcs, indent+"    ") +
+			indent + "}\n"
 	}
 	return ""
 }
 
 func (c *Compiler) transpileExpression(expr ast.Expression) string {
-	if expr == nil { return "make_str(\"\")" }
+	if expr == nil {
+		return "make_str(\"\")"
+	}
 	switch e := expr.(type) {
-	case *ast.Identifier: return e.Value
-	case *ast.IntegerLiteral: return "make_int(" + strconv.FormatInt(e.Value, 10) + ")"
+	case *ast.InterpolatedStringLiteral:
+		sb := "({ VoltBuffer* _b = volt_buf_new(); "
+		for _, seg := range e.Segments {
+			sb += "volt_buf_append(_b, to_str(" + c.transpileExpression(seg) + ")); "
+		}
+		sb += " make_str(_b->data); })"
+		return sb
+	case *ast.Identifier:
+		return e.Value
+	case *ast.IntegerLiteral:
+		return "make_int(" + strconv.FormatInt(e.Value, 10) + ")"
 	case *ast.StringLiteral:
 		esc := strings.ReplaceAll(e.Value, "\\", "\\\\")
 		esc = strings.ReplaceAll(esc, "\"", "\\\"")
 		return "make_str(\"" + esc + "\")"
-	case *ast.Boolean: return "make_bool(" + strconv.FormatBool(e.Value) + ")"
+	case *ast.Boolean:
+		return "make_bool(" + strconv.FormatBool(e.Value) + ")"
 	case *ast.ArrayLiteral:
 		elems := []string{}
-		for _, el := range e.Elements { elems = append(elems, c.transpileExpression(el)) }
+		for _, el := range e.Elements {
+			elems = append(elems, c.transpileExpression(el))
+		}
 		inner := ""
-		for i, el := range elems { inner += "a->a.elements[" + strconv.Itoa(i) + "] = " + el + "; " }
+		for i, el := range elems {
+			inner += "a->a.elements[" + strconv.Itoa(i) + "] = " + el + "; "
+		}
 		return "({ VoltValue* a = malloc(sizeof(VoltValue)); a->type = TYPE_ARRAY; a->a.len = " + strconv.Itoa(len(elems)) + "; a->a.elements = malloc(" + strconv.Itoa(len(elems)) + " * sizeof(VoltValue*)); " + inner + " a; })"
 	case *ast.IndexExpression:
 		it := c.transpileExpression(e.Left)
 		idx := c.transpileExpression(e.Index)
 		return "((" + it + "->type == TYPE_ARRAY) ? " + it + "->a.elements[" + idx + "->i] : map_get(" + it + ", to_str(" + idx + ")))"
-	case *ast.InfixExpression: return "dynamic_add(" + c.transpileExpression(e.Left) + ", " + c.transpileExpression(e.Right) + ")"
+	case *ast.InfixExpression:
+		return "dynamic_add(" + c.transpileExpression(e.Left) + ", " + c.transpileExpression(e.Right) + ")"
 	case *ast.MethodCallExpression:
 		obj := c.transpileExpression(e.Object)
 		switch e.Method.Value {
-		case "trim": return "str_trim(" + obj + ")"
-		case "upper": return "str_upper(" + obj + ")"
+		case "trim":
+			return "str_trim(" + obj + ")"
+		case "upper":
+			return "str_upper(" + obj + ")"
 		}
 	case *ast.CallExpression:
 		nameIdent, ok := e.Function.(*ast.Identifier)
 		if !ok {
 			fexpr := c.transpileExpression(e.Function)
 			args := []string{}
-			for _, arg := range e.Arguments { args = append(args, c.transpileExpression(arg)) }
+			for _, arg := range e.Arguments {
+				args = append(args, c.transpileExpression(arg))
+			}
 			argv := "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
-			for i, arg := range args { argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; " }
+			for i, arg := range args {
+				argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
+			}
 			argv += " v; })"
 			return fexpr + "->f(" + strconv.Itoa(len(args)) + ", " + argv + ")"
 		}
 		name := nameIdent.Value
 		args := []string{}
-		for _, arg := range e.Arguments { args = append(args, c.transpileExpression(arg)) }
-		switch name {
-		case "print": return "printf(\"%s\\n\", to_str(" + args[0] + "))"
-		case "json_parse": return "json_parse(to_str(" + args[0] + "))"
-		case "db_save": return "db_save(to_str(" + args[0] + "), to_str(" + args[1] + "))"
-		case "db_get": return "db_get(to_str(" + args[0] + "))"
-		case "file_write": return "volt_file_write(to_str(" + args[0] + "), to_str(" + args[1] + "))"
-		case "get_addr": return "make_str(({ char* b = malloc(32); sprintf(b, \"%p\", (void*)" + args[0] + "); b; }))"
-		default:
+		for _, arg := range e.Arguments {
+			args = append(args, c.transpileExpression(arg))
+		}
+
+		// Check if it's a known component alias
+		if alias, ok := c.ComponentAliases[name]; ok {
 			argv := "NULL"
 			if len(args) > 0 {
 				argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
-				for i, arg := range args { argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; " }
+				for i, arg := range args {
+					argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
+				}
+				argv += " v; })"
+			}
+			// In component render call, pass ctx if we have one, otherwise NULL (or fresh)
+			ctxParam := "NULL"
+			if c.curComponent != "" {
+				ctxParam = "ctx"
+			} else {
+				// From main scope, we might want to capture the output or just print it.
+				// For now let's just create a temporary buffer and print it.
+				return "({ VoltBuffer* _b = volt_buf_new(); render_" + alias + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); printf(\"%s\\n\", _b->data); make_str(\"\"); })"
+			}
+			return "({ render_" + alias + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })"
+		}
+
+		switch name {
+		case "print":
+			return "printf(\"%s\\n\", to_str(" + args[0] + "))"
+		case "json_parse":
+			return "json_parse(to_str(" + args[0] + "))"
+		case "db_save":
+			return "db_save(to_str(" + args[0] + "), to_str(" + args[1] + "))"
+		case "db_get":
+			return "db_get(to_str(" + args[0] + "))"
+		case "file_write":
+			return "volt_file_write(to_str(" + args[0] + "), to_str(" + args[1] + "))"
+		case "get_addr":
+			return "make_str(({ char* b = malloc(32); sprintf(b, \"%p\", (void*)" + args[0] + "); b; }))"
+		default:
+			// Check if it is a component render call (explicit render_ prefix)
+			if strings.HasPrefix(name, "render_") {
+				compName := strings.TrimPrefix(name, "render_")
+				argv := "NULL"
+				if len(args) > 0 {
+					argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
+					for i, arg := range args {
+						argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
+					}
+					argv += " v; })"
+				}
+				ctxParam := "NULL"
+				if c.curComponent != "" {
+					ctxParam = "ctx"
+				} else {
+					return "({ VoltBuffer* _b = volt_buf_new(); render_" + compName + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); printf(\"%s\\n\", _b->data); make_str(\"\"); })"
+				}
+				return "({ render_" + compName + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })"
+			}
+
+			argv := "NULL"
+			if len(args) > 0 {
+				argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
+				for i, arg := range args {
+					argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
+				}
 				argv += " v; })"
 			}
 			return name + "->f(" + strconv.Itoa(len(args)) + ", " + argv + ")"

@@ -9,15 +9,47 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: ks-volt <filename.kv>")
+		fmt.Println("Usage: ks-volt <filename.kv> OR ks-volt watch <filename.kv>")
 		os.Exit(1)
 	}
 
+	mode := "compile"
 	filename := os.Args[1]
+
+	if os.Args[1] == "watch" {
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: ks-volt watch <filename.kv>")
+			os.Exit(1)
+		}
+		mode = "watch"
+		filename = os.Args[2]
+	}
+
+	if mode == "watch" {
+		fmt.Printf("Watching %s for changes...\n", filename)
+		var lastMod time.Time
+		for {
+			info, err := os.Stat(filename)
+			if err == nil {
+				if info.ModTime().After(lastMod) {
+					fmt.Printf("Change detected. Recompiling...\n")
+					runCompilation(filename)
+					lastMod = info.ModTime()
+				}
+			}
+			time.Sleep(1 * time.Second)
+		}
+	} else {
+		runCompilation(filename)
+	}
+}
+
+func runCompilation(filename string) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		fmt.Printf("Error reading file %s: %s\n", filename, err)
@@ -42,18 +74,41 @@ func main() {
 		fmt.Printf("Error writing temporary C file: %s\n", err)
 		os.Exit(1)
 	}
-	defer os.Remove(tempFile)
 
 	outputBinary := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 
-	// GCC Orchestration: O3 optimization, pthread for concurrency, static linking, strip symbols
-	cmd := exec.Command("gcc", "-O3", "-pthread", "-static", "-s", "-w", tempFile, "-o", outputBinary)
+	gccArgs := []string{"-O3", "-pthread", "-s", "-w", "-DCONFIG_VERSION=\"2024-01-13\"", "-D_GNU_SOURCE", tempFile}
+
+	// Add JS dependency
+	gccArgs = append(gccArgs, "deps/quickjs.c", "deps/libbf.c", "deps/libunicode.c", "deps/cutils.c", "deps/libregexp.c", "deps/quickjs-libc.c")
+
+	// Add Polyglot libs
+	for _, lib := range c.LinkLibs {
+		gccArgs = append(gccArgs, lib)
+	}
+
+	// Add Python flags if needed
+	if c.PythonNeeded {
+		pyCflags, _ := exec.Command("python3-config", "--cflags").Output()
+		pyLdflags, _ := exec.Command("python3-config", "--embed", "--ldflags").Output()
+		for _, f := range strings.Fields(string(pyCflags)) {
+			gccArgs = append(gccArgs, f)
+		}
+		for _, f := range strings.Fields(string(pyLdflags)) {
+			gccArgs = append(gccArgs, f)
+		}
+	}
+
+	gccArgs = append(gccArgs, "-lm", "-ldl", "-o", outputBinary)
+
+	// GCC Orchestration
+	cmd := exec.Command("gcc", gccArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
 		fmt.Printf("Error compiling KS-Volt script via GCC: %s\n", err)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Printf("Successfully compiled %s to STATIC NATIVE BINARY: %s\n", filename, outputBinary)

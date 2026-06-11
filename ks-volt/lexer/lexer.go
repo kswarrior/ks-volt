@@ -43,17 +43,36 @@ func (l *Lexer) NextToken() token.Token {
 		return l.NextToken()
 	}
 
+	if l.ch == '-' && l.peekChar() == '>' {
+		l.readChar()
+		l.readChar()
+		return token.Token{Type: token.ARROW, Literal: "->"}
+	}
+
 	switch l.ch {
-	case '=': tok = newToken(token.ASSIGN, l.ch)
-	case '+': tok = newToken(token.PLUS, l.ch)
-	case '.': tok = newToken(token.DOT, l.ch)
-	case ',': tok = newToken(token.COMMA, l.ch)
-	case '(': tok = newToken(token.LPAREN, l.ch)
-	case ')': tok = newToken(token.RPAREN, l.ch)
-	case '{': tok = newToken(token.LBRACE, l.ch)
-	case '}': tok = newToken(token.RBRACE, l.ch)
-	case '[': tok = newToken(token.LBRACKET, l.ch)
-	case ']': tok = newToken(token.RBRACKET, l.ch)
+	case '=':
+		tok = newToken(token.ASSIGN, l.ch)
+	case '+':
+		tok = newToken(token.PLUS, l.ch)
+	case '.':
+		tok = newToken(token.DOT, l.ch)
+	case ',':
+		tok = newToken(token.COMMA, l.ch)
+	case '(':
+		tok = newToken(token.LPAREN, l.ch)
+	case ')':
+		tok = newToken(token.RPAREN, l.ch)
+	case '{':
+		tok = newToken(token.LBRACE, l.ch)
+	case '}':
+		tok = newToken(token.RBRACE, l.ch)
+	case '[':
+		tok = newToken(token.LBRACKET, l.ch)
+	case ']':
+		tok = newToken(token.RBRACKET, l.ch)
+	case '`':
+		tok.Type = token.BACKTICK
+		tok.Literal = l.readBacktickString()
 	case '"':
 		tok.Type = token.STRING
 		tok.Literal = l.readString()
@@ -64,6 +83,14 @@ func (l *Lexer) NextToken() token.Token {
 		if isLetter(l.ch) {
 			tok.Literal = l.readIdentifier()
 			tok.Type = token.LookupIdent(tok.Literal)
+
+			if isPolyglotBlock(tok.Type) {
+				l.skipWhitespace()
+				if l.ch == '{' {
+					tok.Literal = l.readRawBlock()
+				}
+			}
+
 			return tok
 		} else if isDigit(l.ch) {
 			tok.Type = token.INT
@@ -87,6 +114,17 @@ func (l *Lexer) readString() string {
 			continue
 		}
 		if l.ch == '"' || l.ch == 0 {
+			break
+		}
+	}
+	return l.input[position:l.position]
+}
+
+func (l *Lexer) readBacktickString() string {
+	position := l.position + 1
+	for {
+		l.readChar()
+		if l.ch == '`' || l.ch == 0 {
 			break
 		}
 	}
@@ -128,6 +166,31 @@ func isLetter(ch byte) bool {
 
 func isDigit(ch byte) bool {
 	return '0' <= ch && ch <= '9'
+}
+
+func isPolyglotBlock(t token.TokenType) bool {
+	return t == token.GO_BLOCK || t == token.RUST_BLOCK || t == token.JS_BLOCK || t == token.PY_BLOCK
+}
+
+func (l *Lexer) readRawBlock() string {
+	l.readChar() // skip {
+	pos := l.position
+	count := 1
+	for count > 0 && l.ch != 0 {
+		if l.ch == '{' {
+			count++
+		} else if l.ch == '}' {
+			count--
+		}
+		if count > 0 {
+			l.readChar()
+		}
+	}
+	content := l.input[pos:l.position]
+	if l.ch == '}' {
+		l.readChar()
+	}
+	return content
 }
 
 func newToken(t token.TokenType, ch byte) token.Token {
