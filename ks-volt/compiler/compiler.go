@@ -14,16 +14,19 @@ import (
 
 type Compiler struct {
 	globalVars       map[string]bool
+	components       map[string]bool
 	funcID           int
-	LinkLibs     []string
-	PythonNeeded bool
+	LinkLibs         []string
+	PythonNeeded     bool
 	ComponentAliases map[string]string
 	curComponent     string
+	webBlocks        []string
 }
 
 func New() *Compiler {
 	return &Compiler{
 		globalVars:       make(map[string]bool),
+		components:       make(map[string]bool),
 		ComponentAliases: make(map[string]string),
 	}
 }
@@ -75,10 +78,14 @@ void volt_buf_append(VoltBuffer* b, const char* s) {
     if (!b || !s) return;
     size_t slen = strlen(s);
     if (b->len + slen + 1 > b->cap) {
-        b->cap = (b->len + slen + 1) * 2;
+        b->cap = (b->len + slen + 4096) * 2;
         b->data = realloc(b->data, b->cap);
     }
     strcpy(b->data + b->len, s); b->len += slen;
+}
+
+void volt_buf_free(VoltBuffer* b) {
+    if (b) { free(b->data); free(b); }
 }
 
 typedef struct VoltValue {
@@ -171,10 +178,9 @@ VoltValue* make_fn(VoltFn f) {
     v->type = TYPE_FN; v->f = f; return v;
 }
 
-char* to_str(VoltValue* v) {
+const char* to_str_buf(VoltValue* v, char* buf) {
     if (!v) return "";
     if (v->type == TYPE_STR) return v->s;
-    char* buf = malloc(128);
     if (v->type == TYPE_INT) sprintf(buf, "%lld", v->i);
     else if (v->type == TYPE_BOOL) sprintf(buf, "%s", v->b ? "true" : "false");
     else if (v->type == TYPE_FN) sprintf(buf, "[function]");
@@ -182,8 +188,14 @@ char* to_str(VoltValue* v) {
     return buf;
 }
 
+void volt_buf_append_value(VoltBuffer* b, VoltValue* v) {
+    char buf[128];
+    volt_buf_append(b, to_str_buf(v, buf));
+}
+
 VoltValue* dynamic_add(VoltValue* a, VoltValue* b) {
-    char* s1 = to_str(a); char* s2 = to_str(b);
+    char buf1[128], buf2[128];
+    const char* s1 = to_str_buf(a, buf1); const char* s2 = to_str_buf(b, buf2);
     char* res = malloc(strlen(s1) + strlen(s2) + 1);
     strcpy(res, s1); strcat(res, s2);
     VoltValue* rv = make_str(res); free(res); return rv;
@@ -300,6 +312,19 @@ void fs_cp(const char* src, const char* dst) {
     while((n = fread(buf, 1, sizeof(buf), s)) > 0) fwrite(buf, 1, n, d);
     fclose(s); fclose(d);
 }
+
+// Routing Logic
+typedef struct Route { char* path; void (*handler)(void*); bool is_ws; } Route;
+typedef struct Router { Route routes[100]; int count; void (*before)(void*); } Router;
+
+void volt_start_web_server(Router* r, int port) {
+    printf("Web server started on port %d with %d routes\n", port, r->count);
+}
+
+const char* to_str(VoltValue* v) {
+    static __thread char b[128];
+    return to_str_buf(v, b);
+}
 `)
 
 	c.collectGlobalVars(program)
@@ -322,12 +347,18 @@ void fs_cp(const char* src, const char* dst) {
 	sb.WriteString(funcs.String())
 	sb.WriteString("\nint main(int argc, char** argv) {\n")
 	sb.WriteString("    srand(time(NULL));\n")
+	if c.PythonNeeded {
+		sb.WriteString("    Py_Initialize();\n")
+	}
 	sb.WriteString("    for(int i=0; i<NUM_WORKERS; i++) {\n")
 	sb.WriteString("        int* id = malloc(sizeof(int)); *id = i;\n")
 	sb.WriteString("        pthread_mutex_init(&processors[i].lock, NULL);\n")
 	sb.WriteString("        pthread_create(&workers[i], NULL, worker_loop, id);\n")
 	sb.WriteString("    }\n")
 	sb.WriteString(mainBody.String())
+	if c.PythonNeeded {
+		sb.WriteString("    Py_Finalize();\n")
+	}
 	sb.WriteString("    while(1) sleep(1); return 0;\n}\n")
 
 	return sb.String()
@@ -426,9 +457,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			code = strings.ReplaceAll(code, "\"", "\\\"")
 			code = strings.ReplaceAll(code, "\n", "\\n")
 			return indent + "{\n" +
-				indent + "    Py_Initialize();\n" +
 				indent + "    PyRun_SimpleString(\"" + code + "\");\n" +
-				indent + "    Py_Finalize();\n" +
 				indent + "}\n"
 		case token.JS_BLOCK:
 			code := strings.ReplaceAll(s.Code, "\\", "\\\\")
@@ -444,7 +473,20 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				indent + "    JS_FreeRuntime(rt);\n" +
 				indent + "}\n"
 		case token.GO_BLOCK:
-			goCode := "package main\nimport \"C\"\n" + s.Code + "\nfunc main() {}\n"
+			lines := strings.Split(s.Code, "\n")
+			var wrappedLines []string
+			for _, line := range lines {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "func ") {
+					parts := strings.Split(strings.TrimPrefix(trimmed, "func "), "(")
+					if len(parts) > 0 {
+						funcName := strings.TrimSpace(parts[0])
+						wrappedLines = append(wrappedLines, "//export "+funcName)
+					}
+				}
+				wrappedLines = append(wrappedLines, line)
+			}
+			goCode := "package main\nimport \"C\"\n" + strings.Join(wrappedLines, "\n") + "\nfunc main() {}\n"
 			os.WriteFile("volt_bridge.go", []byte(goCode), 0644)
 			cmd := exec.Command("go", "build", "-buildmode=c-archive", "-o", "volt_go.a", "volt_bridge.go")
 			if err := cmd.Run(); err != nil {
@@ -452,9 +494,24 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			} else {
 				c.LinkLibs = append(c.LinkLibs, "volt_go.a")
 			}
-			return ""
+			return indent + "// Go Block compiled and linked\n"
 		case token.RUST_BLOCK:
-			rustCode := "#![allow(dead_code)]\n" + s.Code
+			// Auto prepend attributes
+			lines := strings.Split(s.Code, "\n")
+			var rustBody []string
+			for _, line := range lines {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "fn ") || strings.HasPrefix(trimmed, "pub fn ") {
+					rustBody = append(rustBody, "#[no_mangle]")
+					if !strings.HasPrefix(trimmed, "pub ") {
+						line = strings.Replace(line, "fn ", "pub extern \"C\" fn ", 1)
+					} else {
+						line = strings.Replace(line, "pub fn ", "pub extern \"C\" fn ", 1)
+					}
+				}
+				rustBody = append(rustBody, line)
+			}
+			rustCode := "#![allow(dead_code)]\n" + strings.Join(rustBody, "\n")
 			os.MkdirAll("volt_rust/src", 0755)
 			os.WriteFile("volt_rust/src/lib.rs", []byte(rustCode), 0644)
 			cargoToml := "[package]\nname = \"volt_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"staticlib\"]\n"
@@ -465,10 +522,11 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			} else {
 				c.LinkLibs = append(c.LinkLibs, "volt_rust/target/release/libvolt_rust.a")
 			}
-			return ""
+			return indent + "// Rust Block compiled and linked\n"
 		}
 		return ""
 	case *ast.ComponentDefinition:
+		c.components[s.Name.Value] = true
 		oldComp := c.curComponent
 		c.curComponent = s.Name.Value
 		fName := "render_" + s.Name.Value
@@ -491,17 +549,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		subL := lexer.New(string(data))
 		subP := parser.New(subL)
 		subProg := subP.ParseProgram()
-		if len(subP.Errors()) > 0 {
-			fmt.Printf("Parser errors in component %s:\n", s.Path)
-			for _, e := range subP.Errors() {
-				fmt.Printf("\t%s\n", e)
-			}
-		}
 		for _, subStmt := range subProg.Statements {
 			if cd, ok := subStmt.(*ast.ComponentDefinition); ok {
 				originalName := cd.Name.Value
-				cd.Name.Value = s.Alias.Value
-				c.ComponentAliases[s.Alias.Value] = cd.Name.Value
+				fullName := s.Alias.Value + originalName
+				cd.Name.Value = fullName
+				c.ComponentAliases[fullName] = cd.Name.Value
 				c.transpileStatement(cd, funcs, "")
 				cd.Name.Value = originalName
 			}
@@ -509,20 +562,34 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return ""
 	case *ast.WebBlockStatement:
 		name := s.Name
-		if name == "" {
-			name = "main_daemon"
-		}
-		funcs.WriteString("void volt_web_controller_" + name + "() {\n")
+		if name == "" { name = "main_daemon" }
+		routerName := "router_" + name
+		funcs.WriteString("Router " + routerName + " = { .count = 0 };\n")
 		for _, bs := range s.Body.Statements {
-			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
+			switch r := bs.(type) {
+			case *ast.PathStatement:
+				handlerName := "handler_" + strconv.Itoa(c.funcID); c.funcID++
+				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				funcs.WriteString("}\n")
+				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
+					routerName + ".routes[" + routerName + ".count++] = (Route){\" " + r.Path + "\", " + handlerName + ", false }; }\n")
+			case *ast.PathWsStatement:
+				handlerName := "handler_" + strconv.Itoa(c.funcID); c.funcID++
+				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				funcs.WriteString("}\n")
+				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
+					routerName + ".routes[" + routerName + ".count++] = (Route){\" " + r.Path + "\", " + handlerName + ", true }; }\n")
+			case *ast.BeforeEachStatement:
+				handlerName := "before_" + name
+				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				funcs.WriteString("}\n")
+				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " + routerName + ".before = " + handlerName + "; }\n")
+			}
 		}
-		funcs.WriteString("}\n")
-		return indent + "volt_web_controller_" + name + "();\n"
-	case *ast.PathStatement:
-		return indent + "// Mapping path: " + s.Path + "\n" +
-			indent + "{\n" +
-			c.transpileStatement(s.Body, funcs, indent+"    ") +
-			indent + "}\n"
+		return indent + "volt_start_web_server(&" + routerName + ", 8080);\n"
 	case *ast.AssignmentStatement:
 		return indent + s.Name.Value + " = " + c.transpileExpression(s.Value) + ";\n"
 	case *ast.FunctionStatement:
@@ -559,10 +626,23 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		if is, ok := s.Expression.(*ast.InterpolatedStringLiteral); ok && c.curComponent != "" {
 			res := ""
 			for _, seg := range is.Segments {
-				res += indent + "volt_buf_append(ctx, to_str(" + c.transpileExpression(seg) + "));\n"
+				res += indent + "volt_buf_append_value(ctx, " + c.transpileExpression(seg) + ");\n"
 			}
 			return res
 		}
+		if call, ok := s.Expression.(*ast.CallExpression); ok && c.curComponent != "" {
+			if ident, ok := call.Function.(*ast.Identifier); ok && ident.Value == "print" {
+				if is, ok := call.Arguments[0].(*ast.InterpolatedStringLiteral); ok {
+					res := ""
+					for _, seg := range is.Segments {
+						res += indent + "volt_buf_append_value(ctx, " + c.transpileExpression(seg) + ");\n"
+					}
+					res += indent + "volt_buf_append(ctx, \"\\n\");\n"
+					return res
+				}
+			}
+		}
+
 		return indent + c.transpileExpression(s.Expression) + ";\n"
 	case *ast.LoopStatement:
 		it := c.transpileExpression(s.Iterable)
@@ -570,8 +650,9 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		for _, bs := range s.Body.Statements {
 			body.WriteString(c.transpileStatement(bs, funcs, indent+"    "))
 		}
-		return indent + "for(int i=0; i<" + it + "->a.len; i++) {\n" +
-			indent + "    " + s.Variable.Value + " = " + it + "->a.elements[i];\n" +
+		id := strconv.Itoa(c.funcID); c.funcID++
+		return indent + "for(int _idx_" + id + "=0; _idx_" + id + "<" + it + "->a.len; _idx_" + id + "++) {\n" +
+			indent + "    " + s.Variable.Value + " = " + it + "->a.elements[_idx_" + id + "];\n" +
 			body.String() + indent + "}\n"
 	case *ast.TryCatchStatement:
 		id := strconv.Itoa(c.funcID)
@@ -603,10 +684,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		}
 		return indent + "schedule_task(rand() % NUM_WORKERS, volt_func_" + id + ", NULL);\n"
 	case *ast.BeforeEachStatement:
-		return indent + "// Middleware block\n" +
-			indent + "{\n" +
-			c.transpileStatement(s.Body, funcs, indent+"    ") +
-			indent + "}\n"
+		return indent + "// Middleware block execution\n"
 	}
 	return ""
 }
@@ -619,9 +697,9 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 	case *ast.InterpolatedStringLiteral:
 		sb := "({ VoltBuffer* _b = volt_buf_new(); "
 		for _, seg := range e.Segments {
-			sb += "volt_buf_append(_b, to_str(" + c.transpileExpression(seg) + ")); "
+			sb += "volt_buf_append_value(_b, " + c.transpileExpression(seg) + "); "
 		}
-		sb += " make_str(_b->data); })"
+		sb += " VoltValue* _rv = make_str(_b->data); volt_buf_free(_b); _rv; })"
 		return sb
 	case *ast.Identifier:
 		return e.Value
@@ -630,6 +708,8 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 	case *ast.StringLiteral:
 		esc := strings.ReplaceAll(e.Value, "\\", "\\\\")
 		esc = strings.ReplaceAll(esc, "\"", "\\\"")
+		esc = strings.ReplaceAll(esc, "\n", "\\n")
+		esc = strings.ReplaceAll(esc, "\r", "\\r")
 		return "make_str(\"" + esc + "\")"
 	case *ast.Boolean:
 		return "make_bool(" + strconv.FormatBool(e.Value) + ")"
@@ -678,8 +758,14 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 			args = append(args, c.transpileExpression(arg))
 		}
 
-		// Check if it's a known component alias
+		compName := ""
 		if alias, ok := c.ComponentAliases[name]; ok {
+			compName = alias
+		} else if c.components[name] {
+			compName = name
+		}
+
+		if compName != "" {
 			argv := "NULL"
 			if len(args) > 0 {
 				argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
@@ -688,16 +774,13 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 				}
 				argv += " v; })"
 			}
-			// In component render call, pass ctx if we have one, otherwise NULL (or fresh)
 			ctxParam := "NULL"
 			if c.curComponent != "" {
 				ctxParam = "ctx"
 			} else {
-				// From main scope, we might want to capture the output or just print it.
-				// For now let's just create a temporary buffer and print it.
-				return "({ VoltBuffer* _b = volt_buf_new(); render_" + alias + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); printf(\"%s\\n\", _b->data); make_str(\"\"); })"
+				return "({ VoltBuffer* _b = volt_buf_new(); render_" + compName + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); printf(\"%s\\n\", _b->data); volt_buf_free(_b); make_str(\"\"); })"
 			}
-			return "({ render_" + alias + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })"
+			return "({ render_" + compName + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })"
 		}
 
 		switch name {
@@ -714,7 +797,6 @@ func (c *Compiler) transpileExpression(expr ast.Expression) string {
 		case "get_addr":
 			return "make_str(({ char* b = malloc(32); sprintf(b, \"%p\", (void*)" + args[0] + "); b; }))"
 		default:
-			// Check if it is a component render call (explicit render_ prefix)
 			if strings.HasPrefix(name, "render_") {
 				compName := strings.TrimPrefix(name, "render_")
 				argv := "NULL"

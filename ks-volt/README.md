@@ -49,7 +49,7 @@ web_block "admin_app" {
   before_each() -> {
     print("Security check")
   }
-  
+
   path("/") -> {
     print("Welcome to Admin")
   }
