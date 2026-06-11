@@ -1,97 +1,85 @@
-# ⚡ KS-Volt: Definitive Edition
+# ⚡ KS-Volt: Definitive Architecture
 
 KS-Volt is an ultra-high-performance, minimalist programming language designed for bare-metal speed and maximum concurrency. It features a clean syntax inspired by Python but compiles directly to **Static Native Machine Binaries** via a feature-complete C runtime.
 
 ## 🚀 Definitive Features
 
 - **True AOT Compilation**: Compiles `.kv` files into standalone, statically linked binaries with ZERO runtime dependencies.
+- **Unified Polyglot Engine**: Execute inline **Go, Rust, JavaScript (QuickJS), and Python** code blocks within a single project.
+- **Hyper-Static Components**: Ingest sub-components at compile-time with alias resolution for zero runtime rendering overhead.
+- **Named Routing Controllers**: Build modular web apps with isolated routing maps and global server-side middleware.
+- **Zero-Allocation Stream Buffers**: High-velocity string interpolation optimized for minimal memory footprint.
 - **M:N Work-Stealing Scheduler**: Custom green-thread scheduler implemented in C for optimal multi-core load balancing.
-- **First-Class Functions**: Define, pass, and execute functions dynamically.
-- **Unmanaged Collections**: Zero-allocation contiguous arrays and vector loops.
-- **Native String Methods**: Built-in `.trim()` and `.upper()` for raw character manipulation.
-- **Pointer Tracking**: Explicit hardware memory address referencing via `get_addr`.
+- **Native FS Macros**: Abbreviated file system primitives (`fs_rm`, `fs_cp`, etc.) mapping directly to POSIX calls.
 - **Sub-Megabyte Memory Footprint**: Aggressive memory management targeting sub-1MB idle RAM usage.
 - **Zero-Overhead Exception Guardrails**: High-speed error trapping using `try/catch` with non-local jumps (`setjmp/longjmp`).
-- **Micro-JSON Scanner**: Reflection-free, high-speed JSON manipulation.
-- **Built-in Web & Networking**: Native support for socket connections, bot streaming, and static web serving.
 
 ## 🛠️ Language Syntax
 
-### Variable Assignment & Conditionals
+### Unified Polyglot Blocks
 ```kv
-IS_SECURE = true
-if (IS_SECURE) {
-    print("Security active")
+go_block {
+  func InternalProcessor() { ... }
+}
+
+rust_block {
+  fn calculate_hash() { ... }
+}
+
+js_block {
+  console.log("QuickJS execution");
 }
 ```
 
-### First-Class Functions
+### Static Components & Ingestion
 ```kv
-fn greet(name) {
-    return "Hello, " + name
+// In components.kv
+component Header(title) {
+  print(`--- ${title} ---`)
 }
-print(greet("KS-Volt"))
+
+// In main.kv
+import_component "components.kv" as UI
+render_UIHeader("Main Dashboard")
 ```
 
-### Unmanaged Arrays & Loops
+### Named Web Controllers
 ```kv
-ports = [25565, 25566, 25567]
-loop p in ports {
-    print("Port: " + p)
+web_block "admin_app" {
+  before_each() -> {
+    print("Security check")
+  }
+  
+  path("/") -> {
+    print("Welcome to Admin")
+  }
 }
 ```
-
-### Exception Handling
-```kv
-try {
-    file_write("log.txt", data)
-} catch (err) {
-    print("Error: " + err)
-}
-```
-
-## 📊 Performance Testing & Monitoring
-
-KS-Volt binaries are designed to be extremely lightweight and fast.
-
-### 1. Check Binary Footprint
-To verify that the binary is statically linked and stripped of symbols (resulting in a small file size):
-```bash
-ls -lh test
-file test
-```
-
-### 2. Monitor RAM Profile
-To monitor the sub-megabyte RAM profile while running the definitive `test.kv` orchestrator:
-```bash
-# In one terminal, run the orchestrator
-./test
-
-# In another terminal, check the resident set size (RSS)
-ps -o rss,command -p $(pgrep test)
-```
-Target: **< 1000 KB (Sub-1MB)**
-
-### 3. Execution Speed
-The M:N scheduler handles thousands of green threads with sub-microsecond latency. You can observe the background telemetry and bot workers running concurrently without blocking the main event loop.
 
 ## 🏁 Getting Started
 
 ### Prerequisites
 - Go (Compiler Frontend)
 - GCC (AOT Backend)
+- Python 3.x (Development Headers)
+- Cargo (Rust blocks support)
 
-### Compile & Run
+### CLI Commands
 ```bash
-go run main.go test.kv
-./test
+# Compile and run
+go run main.go app.kv
+./app
+
+# Watch mode for rapid development
+go run main.go watch app.kv
 ```
 
 ## 📂 Project Structure
 
 - `token/`: Token definitions.
-- `lexer/`: Stateful scanner.
-- `ast/`: Abstract Syntax Tree.
-- `parser/`: Recursive descent parser.
+- `lexer/`: Stateful scanner with raw block support.
+- `ast/`: Abstract Syntax Tree with component and routing nodes.
+- `parser/`: Recursive descent parser with build-time ingestion.
 - `compiler/`: Definitive C-Targeted AOT Compiler & GMP Scheduler.
-- `main.go`: GCC build orchestrator.
+- `deps/`: Embedded QuickJS engine source.
+- `main.go`: GCC build & linker orchestrator with watch mode.
