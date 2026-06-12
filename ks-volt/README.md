@@ -1,85 +1,50 @@
-# ⚡ KS-Volt: Definitive Architecture
+# 🎨 KS-Volt Frontend & Components
 
-KS-Volt is an ultra-high-performance, minimalist programming language designed for bare-metal speed and maximum concurrency. It features a clean syntax inspired by Python but compiles directly to **Static Native Machine Binaries** via a feature-complete C runtime.
+KS-Volt revolutionizes frontend development with **Hyper-Static Components** and an integrated high-velocity web routing DSL.
 
-## 🚀 Definitive Features
+## 🏗️ Hyper-Static Components
 
-- **True AOT Compilation**: Compiles `.kv` files into standalone, statically linked binaries with ZERO runtime dependencies.
-- **Unified Polyglot Engine**: Execute inline **Go, Rust, JavaScript (QuickJS), and Python** code blocks within a single project.
-- **Hyper-Static Components**: Ingest sub-components at compile-time with alias resolution for zero runtime rendering overhead.
-- **Named Routing Controllers**: Build modular web apps with isolated routing maps and global server-side middleware.
-- **Zero-Allocation Stream Buffers**: High-velocity string interpolation optimized for minimal memory footprint.
-- **M:N Work-Stealing Scheduler**: Custom green-thread scheduler implemented in C for optimal multi-core load balancing.
-- **Native FS Macros**: Abbreviated file system primitives (`fs_rm`, `fs_cp`, etc.) mapping directly to POSIX calls.
-- **Sub-Megabyte Memory Footprint**: Aggressive memory management targeting sub-1MB idle RAM usage.
-- **Zero-Overhead Exception Guardrails**: High-speed error trapping using `try/catch` with non-local jumps (`setjmp/longjmp`).
+Components in KS-Volt are not interpreted at runtime. Instead, the compiler performs **Build-Time Ingestion**, translating your `.kv` components into optimized C rendering functions that use the zero-allocation `VoltBuffer` API.
 
-## 🛠️ Language Syntax
-
-### Unified Polyglot Blocks
+### Definition
 ```kv
-go_block {
-  func InternalProcessor() { ... }
-}
-
-rust_block {
-  fn calculate_hash() { ... }
-}
-
-js_block {
-  console.log("QuickJS execution");
-}
-```
-
-### Static Components & Ingestion
-```kv
-// In components.kv
 component Header(title) {
-  print(`--- ${title} ---`)
+    `<h1>${title}</h1>`
 }
-
-// In main.kv
-import_component "components.kv" as UI
-render_UIHeader("Main Dashboard")
 ```
 
-### Named Web Controllers
+### Import & Aliasing
+KS-Volt supports namespaced imports to prevent symbol collisions in large projects:
 ```kv
-web_block "admin_app" {
-  before_each() -> {
-    print("Security check")
-  }
+import_component "ui/navbar.kv" as UI
+UI.Navbar("Home")
+```
 
-  path("/") -> {
-    print("Welcome to Admin")
-  }
+## 🌐 Web Routing Engine
+
+The `web_block` provides a dedicated DSL for defining high-performance controllers and routing logic.
+
+### DSL Structure
+```kv
+web_block "api_v1" {
+    before_each -> {
+        print("Incoming request...")
+    }
+
+    path("/status") -> {
+        `{"status": "online"}`
+    }
+
+    path_ws("/events") -> {
+        // WebSocket handler logic
+    }
 }
 ```
 
-## 🏁 Getting Started
+### Internal Implementation
+*   **Routing Jump Tables**: Routes are registered using C constructors (`__attribute__((constructor))`), creating an efficient jump table for the dispatcher.
+*   **Buffer Inlining**: Interpolated string literals inside routes are automatically directed to the response buffer, avoiding intermediate heap allocations.
 
-### Prerequisites
-- Go (Compiler Frontend)
-- GCC (AOT Backend)
-- Python 3.x (Development Headers)
-- Cargo (Rust blocks support)
+## ⚡ Zero-Allocation Rendering
 
-### CLI Commands
-```bash
-# Compile and run
-go run main.go app.kv
-./app
-
-# Watch mode for rapid development
-go run main.go watch app.kv
-```
-
-## 📂 Project Structure
-
-- `token/`: Token definitions.
-- `lexer/`: Stateful scanner with raw block support.
-- `ast/`: Abstract Syntax Tree with component and routing nodes.
-- `parser/`: Recursive descent parser with build-time ingestion.
-- `compiler/`: Definitive C-Targeted AOT Compiler & GMP Scheduler.
-- `deps/`: Embedded QuickJS engine source.
-- `main.go`: GCC build & linker orchestrator with watch mode.
+When a component is called within a web route or another component, it receives a reference to a `VoltBuffer`. The rendering process consists of direct character-array appends, ensuring minimal RAM usage even under high concurrency.
