@@ -635,7 +635,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
-					routerName + ".routes[" + routerName + ".count++] = (Route){\" " + r.Path + "\", " + handlerName + ", false }; }\n")
+					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", false }; }\n")
 			case *ast.PathWsStatement:
 				handlerName := "handler_" + strconv.Itoa(c.funcID)
 				c.funcID++
@@ -643,7 +643,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
-					routerName + ".routes[" + routerName + ".count++] = (Route){\" " + r.Path + "\", " + handlerName + ", true }; }\n")
+					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", true }; }\n")
 			case *ast.BeforeEachStatement:
 				handlerName := "before_" + name + "_" + strconv.Itoa(c.funcID)
 				c.funcID++

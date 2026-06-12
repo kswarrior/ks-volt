@@ -66,7 +66,11 @@ func runCompilation(filename string) {
 	}
 
 	c := compiler.New()
+	// Set the current directory of the file as search path for imports
+	originalWd, _ := os.Getwd()
+	os.Chdir(filepath.Dir(filename))
 	cCode := c.Compile(program)
+	os.Chdir(originalWd)
 
 	tempFile := "compiled_volt_tmp.c"
 	err = os.WriteFile(tempFile, []byte(cCode), 0644)
@@ -77,10 +81,30 @@ func runCompilation(filename string) {
 
 	outputBinary := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
 
-	gccArgs := []string{"-O3", "-pthread", "-s", "-w", "-DCONFIG_VERSION=\"2024-01-13\"", "-D_GNU_SOURCE", tempFile}
+	// Get binary location to find deps
+	exePath, _ := os.Executable()
+	baseDir := filepath.Dir(exePath)
+	if strings.Contains(exePath, "go-build") {
+		// if running via go run, assume deps are in ks-volt/
+		baseDir, _ = os.Getwd()
+		if !strings.HasSuffix(baseDir, "ks-volt") {
+			baseDir = filepath.Join(baseDir, "ks-volt")
+		}
+	} else {
+		// if running via compiled binary, baseDir might be root.
+		// assume deps are in ks-volt/deps/
+		if _, err := os.Stat(filepath.Join(baseDir, "ks-volt/deps")); err == nil {
+			baseDir = filepath.Join(baseDir, "ks-volt")
+		}
+	}
+
+	gccArgs := []string{"-O3", "-pthread", "-s", "-w", "-DCONFIG_VERSION=\"2024-01-13\"", "-D_GNU_SOURCE", "-I" + baseDir, tempFile}
 
 	// Add JS dependency
-	gccArgs = append(gccArgs, "deps/quickjs.c", "deps/libbf.c", "deps/libunicode.c", "deps/cutils.c", "deps/libregexp.c", "deps/quickjs-libc.c")
+	deps := []string{"deps/quickjs.c", "deps/libbf.c", "deps/libunicode.c", "deps/cutils.c", "deps/libregexp.c", "deps/quickjs-libc.c"}
+	for _, d := range deps {
+		gccArgs = append(gccArgs, filepath.Join(baseDir, d))
+	}
 
 	// Add Polyglot libs
 	for _, lib := range c.LinkLibs {

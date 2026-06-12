@@ -1,0 +1,26 @@
+component LoginPage() {
+    `<html>
+        <head><title>Login - KS-Volt Panel</title></head>
+        <body>
+            <h1>Login</h1>
+            <form action="/login" method="POST">
+                <input type="text" name="username" placeholder="Username" /><br>
+                <input type="password" name="password" placeholder="Password" /><br>
+                <button type="submit">Login</button>
+            </form>
+        </body>
+    </html>`
+}
+
+component Dashboard(user) {
+    `<html>
+        <head><title>Dashboard - KS-Volt Panel</title></head>
+        <body>
+            <h1>Welcome, ${user}!</h1>
+            <p>This is your KS-Volt powered dashboard.</p>
+            <nav>
+                <a href="/logout">Logout</a>
+            </nav>
+        </body>
+    </html>`
+}

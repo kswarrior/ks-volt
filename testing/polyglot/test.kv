@@ -1,0 +1,31 @@
+print("--- Polyglot Block Verification ---")
+
+js_block {
+    const msg = "JavaScript execution context active.";
+    console.log(msg);
+    const sum = (a, b) => a + b;
+    console.log("QuickJS Sum(5, 10):", sum(5, 10));
+}
+
+py_block {
+import platform
+import sys
+print(f"Python execution context active. Version: {platform.python_version()}")
+print(f"Recursion limit: {sys.getrecursionlimit()}")
+}
+
+go_block {
+func GoCheck() string {
+    return "Go execution context active."
+}
+}
+
+rust_block {
+fn rust_check() -> i32 {
+    println!("Rust execution context active.");
+    42
+}
+}
+
+print("Polyglot block setup complete.")
+exit(0)
