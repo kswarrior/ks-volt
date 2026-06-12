@@ -22,18 +22,18 @@ KS-Volt is an ultra-high-performance, compiled programming language designed for
 ```bash
 git clone https://github.com/ks-volt/ks-volt.git
 cd ks-volt
-go build -o ks-volt main.go
+go build -o kv main.go
 ```
 
 ### Run a Script
 ```bash
-./ks-volt my_script.kv
+./kv my_script.kv
 ./my_script
 ```
 
 ### Watch Mode (Developer Velocity)
 ```bash
-./ks-volt watch my_script.kv
+./kv watch my_script.kv
 ```
 
 ## 📖 Documentation

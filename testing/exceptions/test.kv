@@ -1,0 +1,14 @@
+print("--- Exception Guardrail Verification ---")
+
+try {
+    print("Step 1: Attempting unsafe operation...")
+    // file_write to a restricted or non-existent path to trigger jump
+    file_write("/invalid_path/test.txt", "data")
+    print("Step 2: This line should NOT be reached.")
+} catch(err) {
+    print("Step 3: Exception trapped successfully!")
+    print(`Error Message: ${err}`)
+}
+
+print("Step 4: Execution continues safely after catch block.")
+exit(0)

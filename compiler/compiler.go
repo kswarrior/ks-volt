@@ -1043,6 +1043,8 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 				res += "char* _b = malloc(32); sprintf(_b, \"%p\", (void*)_a0); VoltValue* _rv = make_str(_b); free(_b); "
 			case "exit":
 				res += "exit((int)_a0->i); "
+			case "sleep":
+				res += "sleep((int)_a0->i); "
 			default:
 				if strings.HasPrefix(name, "render_") {
 					cName := strings.TrimPrefix(name, "render_")
