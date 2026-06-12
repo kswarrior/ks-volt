@@ -23,6 +23,7 @@ type Compiler struct {
 	curPrefix        string
 	webBlocks        []string
 	importedFiles    map[string]bool
+	ownership        map[string]bool // true if owned, false if moved/borrowed
 }
 
 func New() *Compiler {
@@ -31,6 +32,19 @@ func New() *Compiler {
 		components:       make(map[string]bool),
 		ComponentAliases: make(map[string]string),
 		importedFiles:    make(map[string]bool),
+		ownership:        make(map[string]bool),
+	}
+}
+
+func (c *Compiler) reportError(msg string, tok token.Token, help string) {
+	fmt.Printf("\x1b[31;1merror\x1b[0m: %s\n", msg)
+	fmt.Printf("  --> line %d, col %d\n", tok.Line, tok.Column)
+	fmt.Printf("   |\n")
+	fmt.Printf("%3d| %s\n", tok.Line, tok.Literal)
+	fmt.Printf("   | %s\x1b[31;1m^\x1b[0m\n", strings.Repeat(" ", tok.Column-1))
+	fmt.Printf("   |\n")
+	if help != "" {
+		fmt.Printf("   = \x1b[34;1mhelp\x1b[0m: %s\n\n", help)
 	}
 }
 
@@ -55,11 +69,12 @@ func (c *Compiler) Compile(program *ast.Program) string {
 #include <ctype.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <stdatomic.h>
 
 #define MAX_TASKS 8192
 #define NUM_WORKERS 4
 
-typedef enum { TYPE_STR, TYPE_INT, TYPE_BOOL, TYPE_ARRAY, TYPE_MAP, TYPE_FN } VoltType;
+typedef enum { TYPE_STR, TYPE_INT, TYPE_BOOL, TYPE_ARRAY, TYPE_MAP, TYPE_FN, TYPE_RESULT } VoltType;
 
 struct VoltValue;
 typedef struct VoltValue* (*VoltFn)(int, struct VoltValue**);
@@ -77,14 +92,20 @@ VoltBuffer* volt_buf_new() {
     return b;
 }
 
+#define VOLT_BUF_CHECK(b, l) if ((b)->len + (l) >= (b)->cap) volt_buf_grow((b), (l))
+
+void volt_buf_grow(VoltBuffer* b, size_t needed) {
+    b->cap = (b->len + needed + 4096) * 2;
+    b->data = realloc(b->data, b->cap);
+}
+
 void volt_buf_append(VoltBuffer* b, const char* s) {
     if (!b || !s) return;
     size_t slen = strlen(s);
-    if (b->len + slen + 1 > b->cap) {
-        b->cap = (b->len + slen + 4096) * 2;
-        b->data = realloc(b->data, b->cap);
-    }
-    strcpy(b->data + b->len, s); b->len += slen;
+    VOLT_BUF_CHECK(b, slen);
+    memcpy(b->data + b->len, s, slen);
+    b->len += slen;
+    b->data[b->len] = '\0';
 }
 
 void volt_buf_free(VoltBuffer* b) {
@@ -103,6 +124,7 @@ typedef struct VoltValue {
         struct { struct VoltValue** elements; int len; } a;
         struct { char** keys; struct VoltValue** values; int len; } m;
         VoltFn f;
+        struct { bool is_ok; struct VoltValue* val; } res;
     };
 } VoltValue;
 
@@ -184,6 +206,16 @@ VoltValue* make_fn(VoltFn f) {
     v->type = TYPE_FN; v->f = f; return v;
 }
 
+VoltValue* make_ok(VoltValue* v) {
+    VoltValue* rv = malloc(sizeof(VoltValue));
+    rv->type = TYPE_RESULT; rv->res.is_ok = true; rv->res.val = v; return rv;
+}
+
+VoltValue* make_err(VoltValue* v) {
+    VoltValue* rv = malloc(sizeof(VoltValue));
+    rv->type = TYPE_RESULT; rv->res.is_ok = false; rv->res.val = v; return rv;
+}
+
 VoltValue* volt_value_copy(VoltValue* v) {
     if (!v) return NULL;
     VoltValue* res = malloc(sizeof(VoltValue));
@@ -206,6 +238,10 @@ VoltValue* volt_value_copy(VoltValue* v) {
                 res->m.keys[i] = strdup(v->m.keys[i]);
                 res->m.values[i] = volt_value_copy(v->m.values[i]);
             }
+            break;
+        case TYPE_RESULT:
+            res->res.is_ok = v->res.is_ok;
+            res->res.val = volt_value_copy(v->res.val);
             break;
     }
     return res;
@@ -316,6 +352,8 @@ void volt_value_free(VoltValue* v) {
         }
         free(v->m.keys);
         free(v->m.values);
+    } else if (v->type == TYPE_RESULT) {
+        volt_value_free(v->res.val);
     }
     free(v);
 }
@@ -367,6 +405,27 @@ void fs_cp(const char* src, const char* dst) {
     size_t n;
     while((n = fread(buf, 1, sizeof(buf), s)) > 0) fwrite(buf, 1, n, d);
     fclose(s); fclose(d);
+}
+
+// Thread-Safe Atomic Ring Buffer
+typedef struct {
+    atomic_int head;
+    atomic_int tail;
+    void* buffer[MAX_TASKS];
+} VoltRingBuffer;
+
+void volt_rb_push(VoltRingBuffer* rb, void* item) {
+    int next = (atomic_load(&rb->tail) + 1) % MAX_TASKS;
+    while (next == atomic_load(&rb->head));
+    rb->buffer[atomic_load(&rb->tail)] = item;
+    atomic_store(&rb->tail, next);
+}
+
+void* volt_rb_pop(VoltRingBuffer* rb) {
+    if (atomic_load(&rb->head) == atomic_load(&rb->tail)) return NULL;
+    void* item = rb->buffer[atomic_load(&rb->head)];
+    atomic_store(&rb->head, (atomic_load(&rb->head) + 1) % MAX_TASKS);
+    return item;
 }
 
 // Routing Logic
@@ -456,6 +515,12 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			walker(n.TryBody)
 			c.globalVars[n.CatchVariable.Value] = true
 			walker(n.CatchBody)
+		case *ast.MatchResultStatement:
+			walker(n.ResultExpr)
+			c.globalVars[n.OkVariable.Value] = true
+			walker(n.OkBody)
+			c.globalVars[n.ErrVariable.Value] = true
+			walker(n.ErrBody)
 		case *ast.IfStatement:
 			walker(n.Consequence)
 			if n.Alternative != nil {
@@ -522,6 +587,24 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		}
 		for _, t := range temps {
 			res += indent + "    volt_value_free(" + t + ");\n"
+		}
+		res += indent + "}\n"
+		return res
+	case *ast.MatchResultStatement:
+		code, isTemp := c.transpileExpression(s.ResultExpr)
+		res := indent + "{\n"
+		res += indent + "    VoltValue* _res = " + code + ";\n"
+		res += indent + "    if (_res->type == TYPE_RESULT) {\n"
+		res += indent + "        if (_res->res.is_ok) {\n"
+		res += indent + "            volt_set_value(&" + s.OkVariable.Value + ", volt_value_copy(_res->res.val));\n"
+		res += c.transpileStatement(s.OkBody, funcs, indent+"            ")
+		res += indent + "        } else {\n"
+		res += indent + "            volt_set_value(&" + s.ErrVariable.Value + ", volt_value_copy(_res->res.val));\n"
+		res += c.transpileStatement(s.ErrBody, funcs, indent+"            ")
+		res += indent + "        }\n"
+		res += indent + "    }\n"
+		if isTemp {
+			res += indent + "    volt_value_free(_res);\n"
 		}
 		res += indent + "}\n"
 		return res
@@ -656,8 +739,17 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return indent + "volt_start_web_server(&" + routerName + ", 8080);\n"
 	case *ast.AssignmentStatement:
 		code, isTemp := c.transpileExpression(s.Value)
+		c.ownership[s.Name.Value] = true
 		if isTemp {
 			return indent + "volt_set_value(&" + s.Name.Value + ", " + code + ");\n"
+		}
+		// Move semantics: if it's an identifier, it's moved
+		if ident, ok := s.Value.(*ast.Identifier); ok {
+			if !c.ownership[ident.Value] && c.globalVars[ident.Value] {
+				c.reportError(fmt.Sprintf("use of moved value '%s'", ident.Value), ident.Token, "value was moved here; consider cloning it with 'volt_value_copy' if multi-ownership is required")
+			}
+			c.ownership[ident.Value] = false // marked as moved
+			return indent + "volt_set_value(&" + s.Name.Value + ", " + code + "); " + ident.Value + " = NULL;\n"
 		}
 		return indent + "volt_set_value(&" + s.Name.Value + ", volt_value_copy(" + code + "));\n"
 	case *ast.FunctionStatement:
@@ -866,6 +958,9 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 		sb += " VoltValue* _rv = make_str(_b->data); volt_buf_free(_b); _rv; })"
 		return sb, true
 	case *ast.Identifier:
+		if !c.ownership[e.Value] && c.globalVars[e.Value] {
+			c.reportError(fmt.Sprintf("potential use of moved value '%s'", e.Value), e.Token, "ensure the value is still owned in this scope")
+		}
 		return e.Value, false
 	case *ast.IntegerLiteral:
 		return "make_int(" + strconv.FormatInt(e.Value, 10) + ")", true
@@ -877,6 +972,16 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 		return "make_str(\"" + esc + "\")", true
 	case *ast.Boolean:
 		return "make_bool(" + strconv.FormatBool(e.Value) + ")", true
+	case *ast.ResultLiteral:
+		code, isTemp := c.transpileExpression(e.Value)
+		val := code
+		if !isTemp {
+			val = "volt_value_copy(" + code + ")"
+		}
+		if e.Token.Type == token.OK {
+			return "make_ok(" + val + ")", true
+		}
+		return "make_err(" + val + ")", true
 	case *ast.ArrayLiteral:
 		elems := []string{}
 		for _, el := range e.Elements {
@@ -989,7 +1094,7 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 			}
 		}
 
-		res := "({ "
+	res := "({ VoltValue* _rv = NULL; "
 		if isFuncTemp {
 			res += "VoltValue* _f = " + funcCode + "; "
 		}
@@ -1032,15 +1137,15 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 			case "print":
 				res += "printf(\"%s\\n\", to_str(_a0)); "
 			case "json_parse":
-				res += "VoltValue* _rv = json_parse(to_str(_a0)); "
+				res += "_rv = json_parse(to_str(_a0)); "
 			case "db_save":
 				res += "db_save(to_str(_a0), to_str(_a1)); "
 			case "db_get":
-				res += "VoltValue* _rv = db_get(to_str(_a0)); "
+				res += "_rv = db_get(to_str(_a0)); "
 			case "file_write":
 				res += "volt_file_write(to_str(_a0), to_str(_a1)); "
 			case "get_addr":
-				res += "char* _b = malloc(32); sprintf(_b, \"%p\", (void*)_a0); VoltValue* _rv = make_str(_b); free(_b); "
+				res += "char* _b = malloc(32); sprintf(_b, \"%p\", (void*)_a0); _rv = make_str(_b); free(_b); "
 			case "exit":
 				res += "exit((int)_a0->i); "
 			case "sleep":
@@ -1058,11 +1163,11 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 						res += "render_" + cName + "(" + ctxParam + ", " + strconv.Itoa(len(argCodes)) + ", _argv); "
 					}
 				} else {
-					res += "VoltValue* _rv = " + name + "->f(" + strconv.Itoa(len(argCodes)) + ", _argv); "
+				res += "_rv = " + name + "->f(" + strconv.Itoa(len(argCodes)) + ", _argv); "
 				}
 			}
 		} else {
-			res += "VoltValue* _rv = _f->f(" + strconv.Itoa(len(argCodes)) + ", _argv); "
+			res += "_rv = _f->f(" + strconv.Itoa(len(argCodes)) + ", _argv); "
 		}
 
 		// Cleanup
@@ -1076,10 +1181,10 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 			res += "free(_argv); "
 		}
 
-		if strings.Contains(res, "VoltValue* _rv =") {
+		if strings.Contains(res, "_rv =") {
 			res += "_rv; })"
 		} else {
-			res += "make_str(\"\"); })"
+			res += "_rv = make_str(\"\"); _rv; })"
 		}
 		return res, true
 	}

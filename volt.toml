@@ -1,0 +1,16 @@
+[project]
+name = "ks-volt-app"
+version = "0.1.0"
+entry = "main.kv"
+
+[compiler]
+optimization_level = "O3"
+threads = true
+strip_symbols = true
+suppress_warnings = true
+static_link = true
+
+[runtime]
+max_tasks = 8192
+num_workers = 4
+idle_ram_target_kb = 1500

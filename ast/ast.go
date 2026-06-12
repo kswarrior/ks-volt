@@ -267,3 +267,41 @@ type InterpolatedStringLiteral struct {
 
 func (is *InterpolatedStringLiteral) expressionNode()      {}
 func (is *InterpolatedStringLiteral) TokenLiteral() string { return is.Token.Literal }
+
+type ImportStatement struct {
+	Token token.Token // import
+	Alias *Identifier
+	Path  string
+}
+
+func (is *ImportStatement) statementNode()       {}
+func (is *ImportStatement) TokenLiteral() string { return is.Token.Literal }
+
+type ExportStatement struct {
+	Token token.Token // export
+	Name  *Identifier
+	Value Expression
+}
+
+func (es *ExportStatement) statementNode()       {}
+func (es *ExportStatement) TokenLiteral() string { return es.Token.Literal }
+
+type ResultLiteral struct {
+	Token token.Token // ok or err
+	Value Expression
+}
+
+func (rl *ResultLiteral) expressionNode()      {}
+func (rl *ResultLiteral) TokenLiteral() string { return rl.Token.Literal }
+
+type MatchResultStatement struct {
+	Token         token.Token // result
+	ResultExpr    Expression
+	OkVariable    *Identifier
+	OkBody        *BlockStatement
+	ErrVariable   *Identifier
+	ErrBody       *BlockStatement
+}
+
+func (mrs *MatchResultStatement) statementNode()       {}
+func (mrs *MatchResultStatement) TokenLiteral() string { return mrs.Token.Literal }

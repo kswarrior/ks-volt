@@ -5,6 +5,8 @@ type TokenType string
 type Token struct {
 	Type    TokenType
 	Literal string
+	Line    int
+	Column  int
 }
 
 const (
@@ -76,6 +78,13 @@ const (
 	PATH_WS          = "PATH_WS"
 	BEFORE_EACH      = "BEFORE_EACH"
 	BACKTICK         = "BACKTICK"
+
+	IMPORT = "IMPORT"
+	EXPORT = "EXPORT"
+	FROM   = "FROM"
+	RESULT = "RESULT"
+	OK     = "OK"
+	ERR    = "ERR"
 )
 
 var keywords = map[string]TokenType{
@@ -118,6 +127,12 @@ var keywords = map[string]TokenType{
 	"path":             PATH,
 	"path_ws":          PATH_WS,
 	"before_each":      BEFORE_EACH,
+	"import":           IMPORT,
+	"export":           EXPORT,
+	"from":             FROM,
+	"result":           RESULT,
+	"ok":               OK,
+	"err":              ERR,
 }
 
 func LookupIdent(ident string) TokenType {

@@ -86,6 +86,12 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parsePathWsStatement()
 	case token.BEFORE_EACH:
 		return p.parseBeforeEachStatement()
+	case token.IMPORT:
+		return p.parseImportStatement()
+	case token.EXPORT:
+		return p.parseExportStatement()
+	case token.RESULT:
+		return p.parseMatchResultStatement()
 	case token.IDENT:
 		if p.peekToken.Type == token.ASSIGN {
 			return p.parseAssignmentStatement()
@@ -110,6 +116,107 @@ func (p *Parser) parseFunctionStatement() *ast.FunctionStatement {
 		return nil
 	}
 	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseImportStatement() *ast.ImportStatement {
+	stmt := &ast.ImportStatement{Token: p.curToken}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Alias = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.FROM) {
+		return nil
+	}
+	if !p.expectPeek(token.STRING) {
+		return nil
+	}
+	stmt.Path = p.curToken.Literal
+	return stmt
+}
+
+func (p *Parser) parseExportStatement() *ast.ExportStatement {
+	stmt := &ast.ExportStatement{Token: p.curToken}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.ASSIGN) {
+		return nil
+	}
+	p.nextToken()
+	stmt.Value = p.parseExpression(LOWEST)
+	return stmt
+}
+
+func (p *Parser) parseResultLiteral() ast.Expression {
+	lit := &ast.ResultLiteral{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	p.nextToken()
+	lit.Value = p.parseExpression(LOWEST)
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	return lit
+}
+
+func (p *Parser) parseMatchResultStatement() *ast.MatchResultStatement {
+	stmt := &ast.MatchResultStatement{Token: p.curToken}
+	p.nextToken()
+	stmt.ResultExpr = p.parseExpression(LOWEST)
+
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+
+	if !p.expectPeek(token.OK) {
+		return nil
+	}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.OkVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.ARROW) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.OkBody = p.parseBlockStatement()
+
+	if !p.expectPeek(token.ERR) {
+		return nil
+	}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.ErrVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.ARROW) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.ErrBody = p.parseBlockStatement()
+
+	if !p.expectPeek(token.RBRACE) {
+		return nil
+	}
+
 	return stmt
 }
 
@@ -396,6 +503,8 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 		leftExp = p.parseArrayLiteral()
 	case token.BACKTICK:
 		leftExp = p.parseInterpolatedStringLiteral()
+	case token.OK, token.ERR:
+		leftExp = p.parseResultLiteral()
 	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:

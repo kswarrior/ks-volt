@@ -9,10 +9,12 @@ type Lexer struct {
 	position     int
 	readPosition int
 	ch           byte
+	line         int
+	column       int
 }
 
 func New(input string) *Lexer {
-	l := &Lexer{input: input}
+	l := &Lexer{input: input, line: 1, column: 0}
 	l.readChar()
 	return l
 }
@@ -23,6 +25,14 @@ func (l *Lexer) readChar() {
 	} else {
 		l.ch = l.input[l.readPosition]
 	}
+
+	if l.ch == '\n' {
+		l.line++
+		l.column = 0
+	} else {
+		l.column++
+	}
+
 	l.position = l.readPosition
 	l.readPosition++
 }
@@ -38,6 +48,9 @@ func (l *Lexer) NextToken() token.Token {
 	var tok token.Token
 	l.skipWhitespace()
 
+	line := l.line
+	col := l.column
+
 	if l.ch == '/' && l.peekChar() == '/' {
 		l.skipComment()
 		return l.NextToken()
@@ -46,43 +59,51 @@ func (l *Lexer) NextToken() token.Token {
 	if l.ch == '-' && l.peekChar() == '>' {
 		l.readChar()
 		l.readChar()
-		return token.Token{Type: token.ARROW, Literal: "->"}
+		return token.Token{Type: token.ARROW, Literal: "->", Line: line, Column: col}
 	}
 
 	switch l.ch {
 	case '=':
-		tok = newToken(token.ASSIGN, l.ch)
+		tok = newToken(token.ASSIGN, l.ch, line, col)
 	case '+':
-		tok = newToken(token.PLUS, l.ch)
+		tok = newToken(token.PLUS, l.ch, line, col)
 	case '.':
-		tok = newToken(token.DOT, l.ch)
+		tok = newToken(token.DOT, l.ch, line, col)
 	case ',':
-		tok = newToken(token.COMMA, l.ch)
+		tok = newToken(token.COMMA, l.ch, line, col)
 	case '(':
-		tok = newToken(token.LPAREN, l.ch)
+		tok = newToken(token.LPAREN, l.ch, line, col)
 	case ')':
-		tok = newToken(token.RPAREN, l.ch)
+		tok = newToken(token.RPAREN, l.ch, line, col)
 	case '{':
-		tok = newToken(token.LBRACE, l.ch)
+		tok = newToken(token.LBRACE, l.ch, line, col)
 	case '}':
-		tok = newToken(token.RBRACE, l.ch)
+		tok = newToken(token.RBRACE, l.ch, line, col)
 	case '[':
-		tok = newToken(token.LBRACKET, l.ch)
+		tok = newToken(token.LBRACKET, l.ch, line, col)
 	case ']':
-		tok = newToken(token.RBRACKET, l.ch)
+		tok = newToken(token.RBRACKET, l.ch, line, col)
 	case '`':
 		tok.Type = token.BACKTICK
 		tok.Literal = l.readBacktickString()
+		tok.Line = line
+		tok.Column = col
 	case '"':
 		tok.Type = token.STRING
 		tok.Literal = l.readString()
+		tok.Line = line
+		tok.Column = col
 	case 0:
 		tok.Type = token.EOF
 		tok.Literal = ""
+		tok.Line = line
+		tok.Column = col
 	default:
 		if isLetter(l.ch) {
 			tok.Literal = l.readIdentifier()
 			tok.Type = token.LookupIdent(tok.Literal)
+			tok.Line = line
+			tok.Column = col
 
 			if isPolyglotBlock(tok.Type) {
 				l.skipWhitespace()
@@ -95,9 +116,11 @@ func (l *Lexer) NextToken() token.Token {
 		} else if isDigit(l.ch) {
 			tok.Type = token.INT
 			tok.Literal = l.readNumber()
+			tok.Line = line
+			tok.Column = col
 			return tok
 		} else {
-			tok = newToken(token.ILLEGAL, l.ch)
+			tok = newToken(token.ILLEGAL, l.ch, line, col)
 		}
 	}
 	l.readChar()
@@ -193,6 +216,6 @@ func (l *Lexer) readRawBlock() string {
 	return content
 }
 
-func newToken(t token.TokenType, ch byte) token.Token {
-	return token.Token{Type: t, Literal: string(ch)}
+func newToken(t token.TokenType, ch byte, line, col int) token.Token {
+	return token.Token{Type: t, Literal: string(ch), Line: line, Column: col}
 }
