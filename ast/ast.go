@@ -294,6 +294,15 @@ type ResultLiteral struct {
 func (rl *ResultLiteral) expressionNode()      {}
 func (rl *ResultLiteral) TokenLiteral() string { return rl.Token.Literal }
 
+type BorrowExpression struct {
+	Token token.Token // &
+	Value Expression
+	IsMut bool
+}
+
+func (be *BorrowExpression) expressionNode()      {}
+func (be *BorrowExpression) TokenLiteral() string { return be.Token.Literal }
+
 type MatchResultStatement struct {
 	Token         token.Token // result
 	ResultExpr    Expression

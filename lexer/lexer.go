@@ -83,6 +83,8 @@ func (l *Lexer) NextToken() token.Token {
 		tok = newToken(token.LBRACKET, l.ch, line, col)
 	case ']':
 		tok = newToken(token.RBRACKET, l.ch, line, col)
+	case '&':
+		tok = newToken(token.AMPERSAND, l.ch, line, col)
 	case '`':
 		tok.Type = token.BACKTICK
 		tok.Literal = l.readBacktickString()

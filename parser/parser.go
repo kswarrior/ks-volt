@@ -505,6 +505,8 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 		leftExp = p.parseInterpolatedStringLiteral()
 	case token.OK, token.ERR:
 		leftExp = p.parseResultLiteral()
+	case token.AMPERSAND:
+		leftExp = p.parseBorrowExpression()
 	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
@@ -568,6 +570,17 @@ func (p *Parser) parseExpressionList(end token.TokenType) []ast.Expression {
 		return nil
 	}
 	return list
+}
+
+func (p *Parser) parseBorrowExpression() ast.Expression {
+	exp := &ast.BorrowExpression{Token: p.curToken}
+	p.nextToken()
+	if p.curToken.Type == token.MUT {
+		exp.IsMut = true
+		p.nextToken()
+	}
+	exp.Value = p.parseExpression(100)
+	return exp
 }
 
 func (p *Parser) parseInterpolatedStringLiteral() ast.Expression {

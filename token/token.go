@@ -25,13 +25,14 @@ const (
 	ARROW  = "->"
 
 	// Delimiters
-	COMMA    = ","
-	LPAREN   = "("
-	RPAREN   = ")"
-	LBRACE   = "{"
-	RBRACE   = "}"
-	LBRACKET = "["
-	RBRACKET = "]"
+	COMMA     = ","
+	LPAREN    = "("
+	RPAREN    = ")"
+	LBRACE    = "{"
+	RBRACE    = "}"
+	LBRACKET  = "["
+	RBRACKET  = "]"
+	AMPERSAND = "&"
 
 	// Keywords
 	SPAWN       = "SPAWN"
@@ -85,6 +86,7 @@ const (
 	RESULT = "RESULT"
 	OK     = "OK"
 	ERR    = "ERR"
+	MUT    = "MUT"
 )
 
 var keywords = map[string]TokenType{
@@ -133,6 +135,7 @@ var keywords = map[string]TokenType{
 	"result":           RESULT,
 	"ok":               OK,
 	"err":              ERR,
+	"mut":              MUT,
 }
 
 func LookupIdent(ident string) TokenType {

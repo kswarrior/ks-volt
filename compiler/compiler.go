@@ -21,30 +21,94 @@ type Compiler struct {
 	ComponentAliases map[string]string
 	curComponent     string
 	curPrefix        string
-	webBlocks        []string
 	importedFiles    map[string]bool
 	ownership        map[string]bool // true if owned, false if moved/borrowed
+	borrows          map[string]int  // >0 if borrowed, <0 if mut borrowed (-1)
+	borrowToks       map[string]token.Token
+	borrowScopes     []map[string]int
+	SourceLines      []string
 }
 
-func New() *Compiler {
+func New(source string) *Compiler {
 	return &Compiler{
 		globalVars:       make(map[string]bool),
 		components:       make(map[string]bool),
 		ComponentAliases: make(map[string]string),
 		importedFiles:    make(map[string]bool),
 		ownership:        make(map[string]bool),
+		borrows:          make(map[string]int),
+		borrowToks:       make(map[string]token.Token),
+		borrowScopes:     []map[string]int{},
+		SourceLines:      strings.Split(source, "\n"),
 	}
+}
+
+func (c *Compiler) getLine(line int) string {
+	if line > 0 && line <= len(c.SourceLines) {
+		return c.SourceLines[line-1]
+	}
+	return ""
 }
 
 func (c *Compiler) reportError(msg string, tok token.Token, help string) {
 	fmt.Printf("\x1b[31;1merror\x1b[0m: %s\n", msg)
 	fmt.Printf("  --> line %d, col %d\n", tok.Line, tok.Column)
 	fmt.Printf("   |\n")
-	fmt.Printf("%3d| %s\n", tok.Line, tok.Literal)
+	fmt.Printf("%3d| %s\n", tok.Line, c.getLine(tok.Line))
 	fmt.Printf("   | %s\x1b[31;1m^\x1b[0m\n", strings.Repeat(" ", tok.Column-1))
 	fmt.Printf("   |\n")
 	if help != "" {
 		fmt.Printf("   = \x1b[34;1mhelp\x1b[0m: %s\n\n", help)
+	}
+}
+
+func (c *Compiler) reportLifetimeError(msg string, borrowTok, invalidTok token.Token, help string) {
+	fmt.Printf("\x1b[31;1merror\x1b[0m: %s\n", msg)
+	fmt.Printf("  --> line %d, col %d\n", invalidTok.Line, invalidTok.Column)
+	fmt.Printf("   |\n")
+	fmt.Printf("%3d| %s\n", borrowTok.Line, c.getLine(borrowTok.Line))
+	fmt.Printf("   | %s\x1b[34;1m^-- resource borrowed here\x1b[0m\n", strings.Repeat(" ", borrowTok.Column-1))
+	fmt.Printf("  ...\n")
+	fmt.Printf("%3d| %s\n", invalidTok.Line, c.getLine(invalidTok.Line))
+	fmt.Printf("   | %s\x1b[31;1m^-- move attempted here\x1b[0m\n", strings.Repeat(" ", invalidTok.Column-1))
+	fmt.Printf("   |\n")
+	if help != "" {
+		fmt.Printf("   = \x1b[34;1mhelp\x1b[0m: %s\n\n", help)
+	}
+}
+
+func (c *Compiler) pushScope() {
+	c.borrowScopes = append(c.borrowScopes, make(map[string]int))
+}
+
+func (c *Compiler) popScope() {
+	if len(c.borrowScopes) == 0 {
+		return
+	}
+	lastIdx := len(c.borrowScopes) - 1
+	scope := c.borrowScopes[lastIdx]
+	for name, delta := range scope {
+		if delta == -1 {
+			c.borrows[name] = 0
+		} else {
+			c.borrows[name] -= delta
+		}
+		if c.borrows[name] == 0 {
+			delete(c.borrowToks, name)
+		}
+	}
+	c.borrowScopes = c.borrowScopes[:lastIdx]
+}
+
+func (c *Compiler) recordBorrow(name string, isMut bool) {
+	if len(c.borrowScopes) == 0 {
+		return
+	}
+	scope := c.borrowScopes[len(c.borrowScopes)-1]
+	if isMut {
+		scope[name] = -1
+	} else {
+		scope[name]++
 	}
 }
 
@@ -451,9 +515,6 @@ const char* to_str(VoltValue* v) {
 `)
 
 	c.collectGlobalVars(program)
-	for v := range c.globalVars {
-		sb.WriteString("VoltValue* " + v + ";\n")
-	}
 
 	var funcs strings.Builder
 	var mainBody strings.Builder
@@ -467,6 +528,10 @@ const char* to_str(VoltValue* v) {
 	sb.WriteString("#include \"deps/quickjs.h\"\n")
 	sb.WriteString("#include \"deps/quickjs-libc.h\"\n")
 
+	for v := range c.globalVars {
+		sb.WriteString("VoltValue* " + v + ";\n")
+	}
+
 	sb.WriteString(funcs.String())
 	sb.WriteString("\nint main(int argc, char** argv) {\n")
 	sb.WriteString("    srand(time(NULL));\n")
@@ -478,6 +543,9 @@ const char* to_str(VoltValue* v) {
 	sb.WriteString("        pthread_mutex_init(&processors[i].lock, NULL);\n")
 	sb.WriteString("        pthread_create(&workers[i], NULL, worker_loop, id);\n")
 	sb.WriteString("    }\n")
+	for _, block := range c.webBlocks {
+		sb.WriteString(block)
+	}
 	sb.WriteString(mainBody.String())
 	if c.PythonNeeded {
 		sb.WriteString("    Py_Finalize();\n")
@@ -560,6 +628,14 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return ""
 	}
 	switch s := stmt.(type) {
+	case *ast.BlockStatement:
+		c.pushScope()
+		var sb strings.Builder
+		for _, statement := range s.Statements {
+			sb.WriteString(c.transpileStatement(statement, funcs, indent))
+		}
+		c.popScope()
+		return sb.String()
 	case *ast.FSMacroStatement:
 		res := indent + "{\n"
 		cArgs := []string{}
@@ -646,12 +722,16 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				wrappedLines = append(wrappedLines, line)
 			}
 			goCode := "package main\nimport \"C\"\n" + strings.Join(wrappedLines, "\n") + "\nfunc main() {}\n"
-			os.WriteFile("volt_bridge.go", []byte(goCode), 0644)
-			cmd := exec.Command("go", "build", "-buildmode=c-archive", "-o", "volt_go.a", "volt_bridge.go")
+			bridgeID := c.funcID
+			c.funcID++
+			bridgeName := fmt.Sprintf("volt_bridge_%d.go", bridgeID)
+			archiveName := fmt.Sprintf("volt_go_%d.a", bridgeID)
+			os.WriteFile(bridgeName, []byte(goCode), 0644)
+			cmd := exec.Command("go", "build", "-buildmode=c-archive", "-o", archiveName, bridgeName)
 			if err := cmd.Run(); err != nil {
 				fmt.Printf("Go block compilation error: %v\n", err)
 			} else {
-				c.LinkLibs = append(c.LinkLibs, "volt_go.a")
+				c.LinkLibs = append(c.LinkLibs, archiveName)
 			}
 			return indent + "// Go Block compiled and linked\n"
 		case token.RUST_BLOCK:
@@ -671,15 +751,18 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				rustBody = append(rustBody, line)
 			}
 			rustCode := "#![allow(dead_code)]\n" + strings.Join(rustBody, "\n")
-			os.MkdirAll("volt_rust/src", 0755)
-			os.WriteFile("volt_rust/src/lib.rs", []byte(rustCode), 0644)
-			cargoToml := "[package]\nname = \"volt_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"staticlib\"]\n"
-			os.WriteFile("volt_rust/Cargo.toml", []byte(cargoToml), 0644)
-			cmd := exec.Command("cargo", "build", "--release", "--manifest-path", "volt_rust/Cargo.toml")
+			rustID := c.funcID
+			c.funcID++
+			rustDir := fmt.Sprintf("volt_rust_%d", rustID)
+			os.MkdirAll(rustDir+"/src", 0755)
+			os.WriteFile(rustDir+"/src/lib.rs", []byte(rustCode), 0644)
+			cargoToml := fmt.Sprintf("[package]\nname = \"volt_rust_%d\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"staticlib\"]\n", rustID)
+			os.WriteFile(rustDir+"/Cargo.toml", []byte(cargoToml), 0644)
+			cmd := exec.Command("cargo", "build", "--release", "--manifest-path", rustDir+"/Cargo.toml")
 			if err := cmd.Run(); err != nil {
 				fmt.Printf("Rust block compilation error: %v\n", err)
 			} else {
-				c.LinkLibs = append(c.LinkLibs, "volt_rust/target/release/libvolt_rust.a")
+				c.LinkLibs = append(c.LinkLibs, rustDir+"/target/release/libvolt_rust_"+strconv.Itoa(rustID)+".a")
 			}
 			return indent + "// Rust Block compiled and linked\n"
 		}
@@ -745,6 +828,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		}
 		// Move semantics: if it's an identifier, it's moved
 		if ident, ok := s.Value.(*ast.Identifier); ok {
+			if ident.Value == s.Name.Value {
+				return indent + "// self-assignment skipped for move semantics\n"
+			}
+			if c.borrows[ident.Value] != 0 {
+				c.reportLifetimeError(fmt.Sprintf("cannot move out of '%s' because it is borrowed", ident.Value), c.borrowToks[ident.Value], ident.Token, "resource has active references")
+			}
 			if !c.ownership[ident.Value] && c.globalVars[ident.Value] {
 				c.reportError(fmt.Sprintf("use of moved value '%s'", ident.Value), ident.Token, "value was moved here; consider cloning it with 'volt_value_copy' if multi-ownership is required")
 			}
@@ -778,15 +867,11 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			res += indent + "    volt_value_free(_cond);\n"
 		}
 		res += indent + "    if (_b) {\n"
-		for _, st := range s.Consequence.Statements {
-			res += c.transpileStatement(st, funcs, indent+"        ")
-		}
+		res += c.transpileStatement(s.Consequence, funcs, indent+"        ")
 		res += indent + "    }"
 		if s.Alternative != nil {
 			res += " else {\n"
-			for _, st := range s.Alternative.Statements {
-				res += c.transpileStatement(st, funcs, indent+"        ")
-			}
+			res += c.transpileStatement(s.Alternative, funcs, indent+"        ")
 			res += indent + "    }"
 		}
 		res += "\n" + indent + "}\n"
@@ -811,15 +896,11 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return indent + code + ";\n"
 	case *ast.LoopStatement:
 		code, isTemp := c.transpileExpression(s.Iterable)
-		var body strings.Builder
-		for _, bs := range s.Body.Statements {
-			body.WriteString(c.transpileStatement(bs, funcs, indent+"    "))
-		}
 		res := indent + "{ VoltValue* _it = " + code + ";\n"
 		res += indent + "    if (_it->type == TYPE_ARRAY) {\n"
 		res += indent + "        for(int _idx = 0; _idx < _it->a.len; _idx++) {\n"
 		res += indent + "            volt_set_value(&" + s.Variable.Value + ", volt_value_copy(_it->a.elements[_idx]));\n"
-		res += body.String()
+		res += c.transpileStatement(s.Body, funcs, indent+"            ")
 		res += indent + "        }\n"
 		res += indent + "    }\n"
 		if isTemp {
@@ -831,9 +912,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
 		funcs.WriteString("void volt_try_" + id + "(void* arg) {\n")
-		for _, ts := range s.TryBody.Statements {
-			funcs.WriteString(c.transpileStatement(ts, funcs, "    "))
-		}
+		funcs.WriteString(c.transpileStatement(s.TryBody, funcs, "    "))
 		funcs.WriteString("}\n")
 		return indent + "{ jmp_buf env_" + id + "; current_jmp_env = &env_" + id + ";\n" +
 			indent + "if (setjmp(env_" + id + ") == 0) {\n" +
@@ -845,9 +924,7 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
 		funcs.WriteString("void volt_func_" + id + "(void* arg) {\n")
-		for _, bs := range s.Body.Statements {
-			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
-		}
+		funcs.WriteString(c.transpileStatement(s.Body, funcs, "    "))
 		funcs.WriteString("}\n")
 		if s.Name.Value == "connect_bot" {
 			code0, isTemp0 := c.transpileExpression(s.Args[0])
@@ -972,6 +1049,27 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 		return "make_str(\"" + esc + "\")", true
 	case *ast.Boolean:
 		return "make_bool(" + strconv.FormatBool(e.Value) + ")", true
+	case *ast.BorrowExpression:
+		code, _ := c.transpileExpression(e.Value)
+		ident, ok := e.Value.(*ast.Identifier)
+		if ok {
+			if e.IsMut {
+				if c.borrows[ident.Value] != 0 {
+					c.reportLifetimeError(fmt.Sprintf("cannot mutably borrow '%s' more than once", ident.Value), c.borrowToks[ident.Value], e.Token, "already borrowed")
+				}
+				c.borrows[ident.Value] = -1
+				c.borrowToks[ident.Value] = e.Token
+				c.recordBorrow(ident.Value, true)
+			} else {
+				if c.borrows[ident.Value] < 0 {
+					c.reportLifetimeError(fmt.Sprintf("cannot borrow '%s' as immutable because it is also borrowed as mutable", ident.Value), c.borrowToks[ident.Value], e.Token, "mutable borrow active")
+				}
+				c.borrows[ident.Value]++
+				c.borrowToks[ident.Value] = e.Token
+				c.recordBorrow(ident.Value, false)
+			}
+		}
+		return code, false // references don't own
 	case *ast.ResultLiteral:
 		code, isTemp := c.transpileExpression(e.Value)
 		val := code
