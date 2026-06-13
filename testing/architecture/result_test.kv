@@ -1,0 +1,22 @@
+print("--- Result Handling Test ---")
+
+fn get_config(name) {
+    if (name) {
+        return ok("localhost:5432")
+    }
+    return err("Key not found")
+}
+
+val = get_config("db")
+
+result val {
+    ok(v) -> {
+        print(`Success: ${v}`)
+    }
+    err(e) -> {
+        print(`Failed: ${e}`)
+    }
+}
+
+print("Result test complete.")
+exit(0)

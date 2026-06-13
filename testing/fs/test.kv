@@ -1,0 +1,25 @@
+print("--- FS Macro Verification ---")
+
+// Using raw strings to avoid parser conflicts with keywords as variables
+p = "fs_test.txt"
+d = "fs_test_moved.txt"
+c = "fs_test_copy.txt"
+
+print("Step 1: Touching file...")
+fs_touch(p)
+
+print("Step 2: Moving file...")
+fs_mv(p, d)
+
+print("Step 3: Copying file...")
+fs_cp(d, c)
+
+print("Step 4: Displaying content of copied file (expected empty)...")
+fs_cat(c)
+
+print("Step 5: Removing files...")
+fs_rm(d)
+fs_rm(c)
+
+print("FS macro verification complete.")
+exit(0)

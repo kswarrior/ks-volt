@@ -6,6 +6,7 @@ import (
 	"ks-volt/lexer"
 	"ks-volt/token"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -69,6 +70,28 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parseFunctionStatement()
 	case token.RETURN:
 		return p.parseReturnStatement()
+	case token.FS_RM, token.FS_MV, token.FS_CP, token.FS_TOUCH, token.FS_CAT:
+		return p.parseFSMacroStatement()
+	case token.GO_BLOCK, token.RUST_BLOCK, token.JS_BLOCK, token.PY_BLOCK:
+		return p.parsePolyglotBlockStatement()
+	case token.IMPORT_COMPONENT:
+		return p.parseImportComponentStatement()
+	case token.COMPONENT:
+		return p.parseComponentDefinition()
+	case token.WEB_BLOCK:
+		return p.parseWebBlockStatement()
+	case token.PATH:
+		return p.parsePathStatement()
+	case token.PATH_WS:
+		return p.parsePathWsStatement()
+	case token.BEFORE_EACH:
+		return p.parseBeforeEachStatement()
+	case token.IMPORT:
+		return p.parseImportStatement()
+	case token.EXPORT:
+		return p.parseExportStatement()
+	case token.RESULT:
+		return p.parseMatchResultStatement()
 	case token.IDENT:
 		if p.peekToken.Type == token.ASSIGN {
 			return p.parseAssignmentStatement()
@@ -81,12 +104,119 @@ func (p *Parser) parseStatement() ast.Statement {
 
 func (p *Parser) parseFunctionStatement() *ast.FunctionStatement {
 	stmt := &ast.FunctionStatement{Token: p.curToken}
-	if !p.expectPeek(token.IDENT) { return nil }
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
 	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
-	if !p.expectPeek(token.LPAREN) { return nil }
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
 	stmt.Parameters = p.parseFunctionParameters()
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseImportStatement() *ast.ImportStatement {
+	stmt := &ast.ImportStatement{Token: p.curToken}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Alias = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.FROM) {
+		return nil
+	}
+	if !p.expectPeek(token.STRING) {
+		return nil
+	}
+	stmt.Path = p.curToken.Literal
+	return stmt
+}
+
+func (p *Parser) parseExportStatement() *ast.ExportStatement {
+	stmt := &ast.ExportStatement{Token: p.curToken}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.ASSIGN) {
+		return nil
+	}
+	p.nextToken()
+	stmt.Value = p.parseExpression(LOWEST)
+	return stmt
+}
+
+func (p *Parser) parseResultLiteral() ast.Expression {
+	lit := &ast.ResultLiteral{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	p.nextToken()
+	lit.Value = p.parseExpression(LOWEST)
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	return lit
+}
+
+func (p *Parser) parseMatchResultStatement() *ast.MatchResultStatement {
+	stmt := &ast.MatchResultStatement{Token: p.curToken}
+	p.nextToken()
+	stmt.ResultExpr = p.parseExpression(LOWEST)
+
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+
+	if !p.expectPeek(token.OK) {
+		return nil
+	}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.OkVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.ARROW) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.OkBody = p.parseBlockStatement()
+
+	if !p.expectPeek(token.ERR) {
+		return nil
+	}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.ErrVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.ARROW) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.ErrBody = p.parseBlockStatement()
+
+	if !p.expectPeek(token.RBRACE) {
+		return nil
+	}
+
 	return stmt
 }
 
@@ -103,7 +233,9 @@ func (p *Parser) parseFunctionParameters() []*ast.Identifier {
 		p.nextToken()
 		identifiers = append(identifiers, &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal})
 	}
-	if !p.expectPeek(token.RPAREN) { return nil }
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
 	return identifiers
 }
 
@@ -116,15 +248,23 @@ func (p *Parser) parseReturnStatement() *ast.ReturnStatement {
 
 func (p *Parser) parseIfStatement() *ast.IfStatement {
 	stmt := &ast.IfStatement{Token: p.curToken}
-	if !p.expectPeek(token.LPAREN) { return nil }
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
 	p.nextToken()
 	stmt.Condition = p.parseExpression(LOWEST)
-	if !p.expectPeek(token.RPAREN) { return nil }
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.Consequence = p.parseBlockStatement()
 	if p.peekToken.Type == token.ELSE {
 		p.nextToken()
-		if !p.expectPeek(token.LBRACE) { return nil }
+		if !p.expectPeek(token.LBRACE) {
+			return nil
+		}
 		stmt.Alternative = p.parseBlockStatement()
 	}
 	return stmt
@@ -141,43 +281,189 @@ func (p *Parser) parseSpawnStatement() *ast.SpawnStatement {
 		p.peekError(token.IDENT)
 		return nil
 	}
-	if !p.expectPeek(token.LPAREN) { return nil }
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
 	stmt.Args = p.parseCallArguments()
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
 func (p *Parser) parseLoopStatement() *ast.LoopStatement {
 	stmt := &ast.LoopStatement{Token: p.curToken}
-	if !p.expectPeek(token.IDENT) { return nil }
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
 	stmt.Variable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
-	if !p.expectPeek(token.IN) { return nil }
+	if !p.expectPeek(token.IN) {
+		return nil
+	}
 	p.nextToken()
 	stmt.Iterable = p.parseExpression(LOWEST)
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
 func (p *Parser) parseTryCatchStatement() *ast.TryCatchStatement {
 	stmt := &ast.TryCatchStatement{Token: p.curToken}
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.TryBody = p.parseBlockStatement()
-	if !p.expectPeek(token.CATCH) { return nil }
-	if !p.expectPeek(token.LPAREN) { return nil }
-	if !p.expectPeek(token.IDENT) { return nil }
+	if !p.expectPeek(token.CATCH) {
+		return nil
+	}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
 	stmt.CatchVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
-	if !p.expectPeek(token.RPAREN) { return nil }
-	if !p.expectPeek(token.LBRACE) { return nil }
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
 	stmt.CatchBody = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseFSMacroStatement() *ast.FSMacroStatement {
+	stmt := &ast.FSMacroStatement{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	stmt.Args = p.parseCallArguments()
+	return stmt
+}
+
+func (p *Parser) parsePolyglotBlockStatement() *ast.PolyglotBlockStatement {
+	stmt := &ast.PolyglotBlockStatement{Token: p.curToken, Code: p.curToken.Literal}
+	return stmt
+}
+
+func (p *Parser) parseImportComponentStatement() *ast.ImportComponentStatement {
+	stmt := &ast.ImportComponentStatement{Token: p.curToken}
+	if !p.expectPeek(token.STRING) {
+		return nil
+	}
+	stmt.Path = p.curToken.Literal
+	if !p.expectPeek(token.AS) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Alias = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	return stmt
+}
+
+func (p *Parser) parseComponentDefinition() *ast.ComponentDefinition {
+	stmt := &ast.ComponentDefinition{Token: p.curToken}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	if p.peekToken.Type == token.LPAREN {
+		p.nextToken()
+		stmt.Parameters = p.parseFunctionParameters()
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseWebBlockStatement() *ast.WebBlockStatement {
+	stmt := &ast.WebBlockStatement{Token: p.curToken}
+	if p.peekToken.Type == token.STRING {
+		p.nextToken()
+		stmt.Name = p.curToken.Literal
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parsePathStatement() *ast.PathStatement {
+	stmt := &ast.PathStatement{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.STRING) {
+		return nil
+	}
+	stmt.Path = p.curToken.Literal
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if p.peekToken.Type == token.ARROW {
+		p.nextToken()
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parsePathWsStatement() *ast.PathWsStatement {
+	stmt := &ast.PathWsStatement{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.STRING) {
+		return nil
+	}
+	stmt.Path = p.curToken.Literal
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if p.peekToken.Type == token.ARROW {
+		p.nextToken()
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseBeforeEachStatement() *ast.BeforeEachStatement {
+	stmt := &ast.BeforeEachStatement{Token: p.curToken}
+	if p.peekToken.Type == token.LPAREN {
+		p.nextToken()
+		if !p.expectPeek(token.RPAREN) {
+			return nil
+		}
+	}
+	if p.peekToken.Type == token.ARROW {
+		p.nextToken()
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
 	return stmt
 }
 
 func (p *Parser) parseAssignmentStatement() *ast.AssignmentStatement {
 	stmt := &ast.AssignmentStatement{Token: p.curToken}
 	stmt.Name = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
-	if !p.expectPeek(token.ASSIGN) { return nil }
+	if !p.expectPeek(token.ASSIGN) {
+		return nil
+	}
 	p.nextToken()
 	stmt.Value = p.parseExpression(LOWEST)
 	return stmt
@@ -215,6 +501,12 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 		leftExp = &ast.Boolean{Token: p.curToken, Value: p.curToken.Type == token.TRUE}
 	case token.LBRACKET:
 		leftExp = p.parseArrayLiteral()
+	case token.BACKTICK:
+		leftExp = p.parseInterpolatedStringLiteral()
+	case token.OK, token.ERR:
+		leftExp = p.parseResultLiteral()
+	case token.AMPERSAND:
+		leftExp = p.parseBorrowExpression()
 	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
@@ -244,7 +536,9 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 
 func (p *Parser) parseMethodCallExpression(object ast.Expression) ast.Expression {
 	exp := &ast.MethodCallExpression{Token: p.curToken, Object: object}
-	if !p.expectPeek(token.IDENT) { return nil }
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
 	exp.Method = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	if p.peekToken.Type == token.LPAREN {
 		p.nextToken()
@@ -272,15 +566,63 @@ func (p *Parser) parseExpressionList(end token.TokenType) []ast.Expression {
 		p.nextToken()
 		list = append(list, p.parseExpression(LOWEST))
 	}
-	if !p.expectPeek(end) { return nil }
+	if !p.expectPeek(end) {
+		return nil
+	}
 	return list
+}
+
+func (p *Parser) parseBorrowExpression() ast.Expression {
+	exp := &ast.BorrowExpression{Token: p.curToken}
+	p.nextToken()
+	if p.curToken.Type == token.MUT {
+		exp.IsMut = true
+		p.nextToken()
+	}
+	exp.Value = p.parseExpression(100)
+	return exp
+}
+
+func (p *Parser) parseInterpolatedStringLiteral() ast.Expression {
+	lit := &ast.InterpolatedStringLiteral{Token: p.curToken}
+	raw := p.curToken.Literal
+	segments := []ast.Expression{}
+
+	start := 0
+	for {
+		idx := strings.Index(raw[start:], "${")
+		if idx == -1 {
+			segments = append(segments, &ast.StringLiteral{Token: lit.Token, Value: raw[start:]})
+			break
+		}
+		actualIdx := start + idx
+		segments = append(segments, &ast.StringLiteral{Token: lit.Token, Value: raw[start:actualIdx]})
+
+		endIdx := strings.Index(raw[actualIdx:], "}")
+		if endIdx == -1 {
+			segments = append(segments, &ast.StringLiteral{Token: lit.Token, Value: raw[actualIdx:]})
+			break
+		}
+		exprStr := raw[actualIdx+2 : actualIdx+endIdx]
+		// Sub-parser for the interpolation expression
+		subL := lexer.New(exprStr)
+		subP := New(subL)
+		expr := subP.parseExpression(LOWEST)
+		segments = append(segments, expr)
+
+		start = actualIdx + endIdx + 1
+	}
+	lit.Segments = segments
+	return lit
 }
 
 func (p *Parser) parseIndexExpression(left ast.Expression) ast.Expression {
 	exp := &ast.IndexExpression{Token: p.curToken, Left: left}
 	p.nextToken()
 	exp.Index = p.parseExpression(LOWEST)
-	if !p.expectPeek(token.RBRACKET) { return nil }
+	if !p.expectPeek(token.RBRACKET) {
+		return nil
+	}
 	return exp
 }
 
@@ -318,17 +660,23 @@ func (p *Parser) parseCallArguments() []ast.Expression {
 		p.nextToken()
 		args = append(args, p.parseExpression(LOWEST))
 	}
-	if !p.expectPeek(token.RPAREN) { return nil }
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
 	return args
 }
 
 func (p *Parser) peekPrecedence() int {
-	if pre, ok := precedences[p.peekToken.Type]; ok { return pre }
+	if pre, ok := precedences[p.peekToken.Type]; ok {
+		return pre
+	}
 	return LOWEST
 }
 
 func (p *Parser) curPrecedence() int {
-	if pre, ok := precedences[p.curToken.Type]; ok { return pre }
+	if pre, ok := precedences[p.curToken.Type]; ok {
+		return pre
+	}
 	return LOWEST
 }
 

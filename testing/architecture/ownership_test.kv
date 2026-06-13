@@ -1,0 +1,13 @@
+print("--- Ownership Move Semantics Test ---")
+
+a = "Original String"
+print(`A before move: ${a}`)
+
+b = a // Move ownership from a to b
+
+// The following should trigger a compiler warning/error in our enhanced diagnostics
+print(`A after move: ${a}`)
+print(`B after move: ${b}`)
+
+print("Ownership test complete.")
+exit(0)

@@ -1,0 +1,17 @@
+print("--- Concurrency Verification ---")
+
+spawn spawn_task() {
+    print("Task 1: Background worker started.")
+    spawn interval(100) {
+        print("Task 2: Interval heartbeat active.")
+    }
+}
+
+spawn another_task() {
+    print("Task 3: Another concurrent process active.")
+}
+
+print("Main thread active. Scheduler in control.")
+sleep(1)
+print("Concurrency verification phase complete.")
+exit(0)

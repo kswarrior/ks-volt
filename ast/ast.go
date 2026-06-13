@@ -189,3 +189,128 @@ type IndexExpression struct {
 
 func (ie *IndexExpression) expressionNode()      {}
 func (ie *IndexExpression) TokenLiteral() string { return ie.Token.Literal }
+
+type FSMacroStatement struct {
+	Token token.Token
+	Args  []Expression
+}
+
+func (fs *FSMacroStatement) statementNode()       {}
+func (fs *FSMacroStatement) TokenLiteral() string { return fs.Token.Literal }
+
+type PolyglotBlockStatement struct {
+	Token token.Token
+	Code  string
+}
+
+func (ps *PolyglotBlockStatement) statementNode()       {}
+func (ps *PolyglotBlockStatement) TokenLiteral() string { return ps.Token.Literal }
+
+type ImportComponentStatement struct {
+	Token token.Token
+	Path  string
+	Alias *Identifier
+}
+
+func (is *ImportComponentStatement) statementNode()       {}
+func (is *ImportComponentStatement) TokenLiteral() string { return is.Token.Literal }
+
+type ComponentDefinition struct {
+	Token      token.Token
+	Name       *Identifier
+	Parameters []*Identifier
+	Body       *BlockStatement
+}
+
+func (cd *ComponentDefinition) statementNode()       {}
+func (cd *ComponentDefinition) TokenLiteral() string { return cd.Token.Literal }
+
+type WebBlockStatement struct {
+	Token token.Token
+	Name  string // Optional
+	Body  *BlockStatement
+}
+
+func (ws *WebBlockStatement) statementNode()       {}
+func (ws *WebBlockStatement) TokenLiteral() string { return ws.Token.Literal }
+
+type PathStatement struct {
+	Token token.Token
+	Path  string
+	Body  *BlockStatement
+}
+
+func (ps *PathStatement) statementNode()       {}
+func (ps *PathStatement) TokenLiteral() string { return ps.Token.Literal }
+
+type PathWsStatement struct {
+	Token token.Token
+	Path  string
+	Body  *BlockStatement
+}
+
+func (ps *PathWsStatement) statementNode()       {}
+func (ps *PathWsStatement) TokenLiteral() string { return ps.Token.Literal }
+
+type BeforeEachStatement struct {
+	Token token.Token
+	Body  *BlockStatement
+}
+
+func (bs *BeforeEachStatement) statementNode()       {}
+func (bs *BeforeEachStatement) TokenLiteral() string { return bs.Token.Literal }
+
+type InterpolatedStringLiteral struct {
+	Token    token.Token
+	Segments []Expression // alternating StringLiteral and Expressions
+}
+
+func (is *InterpolatedStringLiteral) expressionNode()      {}
+func (is *InterpolatedStringLiteral) TokenLiteral() string { return is.Token.Literal }
+
+type ImportStatement struct {
+	Token token.Token // import
+	Alias *Identifier
+	Path  string
+}
+
+func (is *ImportStatement) statementNode()       {}
+func (is *ImportStatement) TokenLiteral() string { return is.Token.Literal }
+
+type ExportStatement struct {
+	Token token.Token // export
+	Name  *Identifier
+	Value Expression
+}
+
+func (es *ExportStatement) statementNode()       {}
+func (es *ExportStatement) TokenLiteral() string { return es.Token.Literal }
+
+type ResultLiteral struct {
+	Token token.Token // ok or err
+	Value Expression
+}
+
+func (rl *ResultLiteral) expressionNode()      {}
+func (rl *ResultLiteral) TokenLiteral() string { return rl.Token.Literal }
+
+type BorrowExpression struct {
+	Token token.Token // &
+	Value Expression
+	IsMut bool
+}
+
+func (be *BorrowExpression) expressionNode()      {}
+func (be *BorrowExpression) TokenLiteral() string { return be.Token.Literal }
+
+type MatchResultStatement struct {
+	Token         token.Token // result
+	ResultExpr    Expression
+	OkVariable    *Identifier
+	OkBody        *BlockStatement
+	ErrVariable   *Identifier
+	ErrBody       *BlockStatement
+}
+
+func (mrs *MatchResultStatement) statementNode()       {}
+func (mrs *MatchResultStatement) TokenLiteral() string { return mrs.Token.Literal }

@@ -1,0 +1,22 @@
+import_component "ui.kv" as UI
+
+web_block "panel_server" {
+    before_each -> {
+        print("Incoming request to panel...")
+    }
+
+    path("/") -> {
+        UI.LoginPage()
+    }
+
+    path("/dashboard") -> {
+        UI.Dashboard("Admin")
+    }
+
+    path("/login") -> {
+        print("Login attempt detected.")
+        `Redirecting to dashboard...`
+    }
+}
+
+print("Panel server initialized on port 8080")
