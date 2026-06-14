@@ -86,6 +86,8 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parsePathWsStatement()
 	case token.BEFORE_EACH:
 		return p.parseBeforeEachStatement()
+	case token.RENDER_FRAGMENT:
+		return p.parseRenderFragmentStatement()
 	case token.IMPORT:
 		return p.parseImportStatement()
 	case token.EXPORT:
@@ -116,6 +118,17 @@ func (p *Parser) parseFunctionStatement() *ast.FunctionStatement {
 		return nil
 	}
 	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseRenderFragmentStatement() *ast.RenderFragmentStatement {
+	stmt := &ast.RenderFragmentStatement{Token: p.curToken}
+	if p.peekToken.Type == token.LPAREN {
+		p.nextToken()
+		if !p.expectPeek(token.RPAREN) {
+			return nil
+		}
+	}
 	return stmt
 }
 
@@ -322,9 +335,11 @@ func (p *Parser) parseTryCatchStatement() *ast.TryCatchStatement {
 	if !p.expectPeek(token.LPAREN) {
 		return nil
 	}
-	if !p.expectPeek(token.IDENT) {
+	if p.peekToken.Type != token.IDENT && p.peekToken.Type != token.ERR {
+		p.peekError(token.IDENT)
 		return nil
 	}
+	p.nextToken()
 	stmt.CatchVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	if !p.expectPeek(token.RPAREN) {
 		return nil

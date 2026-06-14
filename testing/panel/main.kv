@@ -15,7 +15,12 @@ web_block "panel_server" {
 
     path("/login") -> {
         print("Login attempt detected.")
-        `Redirecting to dashboard...`
+        redirect("/dashboard")
+    }
+
+    path("/fragment") -> {
+        render_fragment()
+        `<div>Only this fragment</div>`
     }
 }
 

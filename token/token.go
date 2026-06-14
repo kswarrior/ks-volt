@@ -78,6 +78,7 @@ const (
 	PATH             = "PATH"
 	PATH_WS          = "PATH_WS"
 	BEFORE_EACH      = "BEFORE_EACH"
+	RENDER_FRAGMENT  = "RENDER_FRAGMENT"
 	BACKTICK         = "BACKTICK"
 
 	IMPORT = "IMPORT"
@@ -129,6 +130,7 @@ var keywords = map[string]TokenType{
 	"path":             PATH,
 	"path_ws":          PATH_WS,
 	"before_each":      BEFORE_EACH,
+	"render_fragment":  RENDER_FRAGMENT,
 	"import":           IMPORT,
 	"export":           EXPORT,
 	"from":             FROM,
