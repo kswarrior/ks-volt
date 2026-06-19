@@ -260,6 +260,23 @@ type BeforeEachStatement struct {
 func (bs *BeforeEachStatement) statementNode()       {}
 func (bs *BeforeEachStatement) TokenLiteral() string { return bs.Token.Literal }
 
+type RenderFragmentStatement struct {
+	Token token.Token
+}
+
+func (rs *RenderFragmentStatement) statementNode()       {}
+func (rs *RenderFragmentStatement) TokenLiteral() string { return rs.Token.Literal }
+
+type DispatchJobStatement struct {
+	Token     token.Token
+	Name      *Identifier
+	Arguments []Expression
+	Body      *BlockStatement
+}
+
+func (ds *DispatchJobStatement) statementNode()       {}
+func (ds *DispatchJobStatement) TokenLiteral() string { return ds.Token.Literal }
+
 type InterpolatedStringLiteral struct {
 	Token    token.Token
 	Segments []Expression // alternating StringLiteral and Expressions

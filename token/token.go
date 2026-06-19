@@ -78,6 +78,10 @@ const (
 	PATH             = "PATH"
 	PATH_WS          = "PATH_WS"
 	BEFORE_EACH      = "BEFORE_EACH"
+	RENDER_FRAGMENT  = "RENDER_FRAGMENT"
+	DISPATCH_JOB     = "DISPATCH_JOB"
+	REQUEST_FORM     = "REQUEST_FORM"
+	REQUEST_JSON     = "REQUEST_JSON"
 	BACKTICK         = "BACKTICK"
 
 	IMPORT = "IMPORT"
@@ -129,6 +133,10 @@ var keywords = map[string]TokenType{
 	"path":             PATH,
 	"path_ws":          PATH_WS,
 	"before_each":      BEFORE_EACH,
+	"render_fragment":  RENDER_FRAGMENT,
+	"dispatch_job":     DISPATCH_JOB,
+	"request_form":     REQUEST_FORM,
+	"request_json":     REQUEST_JSON,
 	"import":           IMPORT,
 	"export":           EXPORT,
 	"from":             FROM,

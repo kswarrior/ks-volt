@@ -8,6 +8,7 @@ import (
 	"ks-volt/token"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,9 @@ type Compiler struct {
 	borrowToks       map[string]token.Token
 	borrowScopes     []map[string]int
 	SourceLines      []string
+	webBlocks        []string
+	isInWebRoute     bool
+	extraFuncs       strings.Builder
 }
 
 func New(source string) *Compiler {
@@ -40,6 +44,7 @@ func New(source string) *Compiler {
 		borrowToks:       make(map[string]token.Token),
 		borrowScopes:     []map[string]int{},
 		SourceLines:      strings.Split(source, "\n"),
+		webBlocks:        []string{},
 	}
 }
 
@@ -209,6 +214,39 @@ __thread int worker_id;
 __thread jmp_buf* current_jmp_env;
 pthread_mutex_t db_file_lock = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct {
+    int client_fd;
+    char* method;
+    char* path;
+    char* headers[50];
+    int header_count;
+    int status;
+    bool is_fragment;
+    VoltBuffer* response_body;
+    char* request_body;
+    void** allocations;
+    int alloc_count;
+    int alloc_cap;
+} VoltContext;
+
+__thread VoltContext* current_web_ctx = NULL;
+
+void* volt_track_alloc_raw(void* ptr) {
+    if (current_web_ctx && ptr) {
+        if (current_web_ctx->alloc_count >= current_web_ctx->alloc_cap) {
+            current_web_ctx->alloc_cap = (current_web_ctx->alloc_cap == 0) ? 128 : current_web_ctx->alloc_cap * 2;
+            current_web_ctx->allocations = realloc(current_web_ctx->allocations, current_web_ctx->alloc_cap * sizeof(void*));
+        }
+        current_web_ctx->allocations[current_web_ctx->alloc_count++] = ptr;
+    }
+    return ptr;
+}
+
+void* volt_track_alloc(size_t size) {
+    void* ptr = malloc(size);
+    return volt_track_alloc_raw(ptr);
+}
+
 void schedule_task(int p_id, void (*func)(void*), void* arg) {
     Processor* p = &processors[p_id];
     pthread_mutex_lock(&p->lock);
@@ -254,52 +292,63 @@ void* worker_loop(void* arg) {
 
 // Runtime Primitives
 VoltValue* make_str(const char* s) {
-    VoltValue* v = malloc(sizeof(VoltValue));
-    v->type = TYPE_STR; v->s = strdup(s ? s : ""); return v;
+    VoltValue* v = volt_track_alloc(sizeof(VoltValue));
+    v->type = TYPE_STR; v->s = strdup(s ? s : "");
+    if (current_web_ctx) volt_track_alloc_raw(v->s);
+    return v;
 }
 VoltValue* make_int(long long i) {
-    VoltValue* v = malloc(sizeof(VoltValue));
+    VoltValue* v = volt_track_alloc(sizeof(VoltValue));
     v->type = TYPE_INT; v->i = i; return v;
 }
 VoltValue* make_bool(bool b) {
-    VoltValue* v = malloc(sizeof(VoltValue));
+    VoltValue* v = volt_track_alloc(sizeof(VoltValue));
     v->type = TYPE_BOOL; v->b = b; return v;
 }
 VoltValue* make_fn(VoltFn f) {
-    VoltValue* v = malloc(sizeof(VoltValue));
+    VoltValue* v = volt_track_alloc(sizeof(VoltValue));
     v->type = TYPE_FN; v->f = f; return v;
 }
 
 VoltValue* make_ok(VoltValue* v) {
-    VoltValue* rv = malloc(sizeof(VoltValue));
+    VoltValue* rv = volt_track_alloc(sizeof(VoltValue));
     rv->type = TYPE_RESULT; rv->res.is_ok = true; rv->res.val = v; return rv;
 }
 
 VoltValue* make_err(VoltValue* v) {
-    VoltValue* rv = malloc(sizeof(VoltValue));
+    VoltValue* rv = volt_track_alloc(sizeof(VoltValue));
     rv->type = TYPE_RESULT; rv->res.is_ok = false; rv->res.val = v; return rv;
 }
 
 VoltValue* volt_value_copy(VoltValue* v) {
     if (!v) return NULL;
-    VoltValue* res = malloc(sizeof(VoltValue));
+    VoltValue* res = volt_track_alloc(sizeof(VoltValue));
     res->type = v->type;
     switch(v->type) {
-        case TYPE_STR: res->s = strdup(v->s); break;
+        case TYPE_STR:
+            res->s = strdup(v->s);
+            if (current_web_ctx) volt_track_alloc_raw(res->s);
+            break;
         case TYPE_INT: res->i = v->i; break;
         case TYPE_BOOL: res->b = v->b; break;
         case TYPE_FN: res->f = v->f; break;
         case TYPE_ARRAY:
             res->a.len = v->a.len;
             res->a.elements = malloc(v->a.len * sizeof(VoltValue*));
+            if (current_web_ctx) volt_track_alloc_raw(res->a.elements);
             for(int i=0; i<v->a.len; i++) res->a.elements[i] = volt_value_copy(v->a.elements[i]);
             break;
         case TYPE_MAP:
             res->m.len = v->m.len;
             res->m.keys = malloc(v->m.len * sizeof(char*));
             res->m.values = malloc(v->m.len * sizeof(VoltValue*));
+            if (current_web_ctx) {
+                volt_track_alloc_raw(res->m.keys);
+                volt_track_alloc_raw(res->m.values);
+            }
             for(int i=0; i<v->m.len; i++) {
                 res->m.keys[i] = strdup(v->m.keys[i]);
+                if (current_web_ctx) volt_track_alloc_raw(res->m.keys[i]);
                 res->m.values[i] = volt_value_copy(v->m.values[i]);
             }
             break;
@@ -319,6 +368,46 @@ const char* to_str_buf(VoltValue* v, char* buf) {
     else if (v->type == TYPE_FN) sprintf(buf, "[function]");
     else return "complex";
     return buf;
+}
+
+void volt_buf_append_json(VoltBuffer* b, VoltValue* v) {
+    if (!v) { volt_buf_append(b, "null"); return; }
+    char buf[128];
+    switch(v->type) {
+        case TYPE_STR:
+            volt_buf_append(b, "\"");
+            volt_buf_append(b, v->s);
+            volt_buf_append(b, "\"");
+            break;
+        case TYPE_INT:
+            sprintf(buf, "%lld", v->i);
+            volt_buf_append(b, buf);
+            break;
+        case TYPE_BOOL:
+            volt_buf_append(b, v->b ? "true" : "false");
+            break;
+        case TYPE_ARRAY:
+            volt_buf_append(b, "[");
+            for(int i=0; i<v->a.len; i++) {
+                volt_buf_append_json(b, v->a.elements[i]);
+                if (i < v->a.len - 1) volt_buf_append(b, ",");
+            }
+            volt_buf_append(b, "]");
+            break;
+        case TYPE_MAP:
+            volt_buf_append(b, "{");
+            for(int i=0; i<v->m.len; i++) {
+                volt_buf_append(b, "\"");
+                volt_buf_append(b, v->m.keys[i]);
+                volt_buf_append(b, "\":");
+                volt_buf_append_json(b, v->m.values[i]);
+                if (i < v->m.len - 1) volt_buf_append(b, ",");
+            }
+            volt_buf_append(b, "}");
+            break;
+        default:
+            volt_buf_append(b, "null");
+    }
 }
 
 void volt_buf_append_value(VoltBuffer* b, VoltValue* v) {
@@ -359,20 +448,26 @@ VoltValue* str_upper(VoltValue* v) {
 }
 
 VoltValue* json_parse(const char* json) {
-    VoltValue* m = malloc(sizeof(VoltValue));
+    VoltValue* m = volt_track_alloc(sizeof(VoltValue));
     m->type = TYPE_MAP; m->m.len = 0;
     m->m.keys = malloc(20 * sizeof(char*));
     m->m.values = malloc(20 * sizeof(VoltValue*));
+    if (current_web_ctx) {
+        volt_track_alloc_raw(m->m.keys);
+        volt_track_alloc_raw(m->m.values);
+    }
     char* s = strdup(json);
-    char* p = strtok(s, "{}\",: ");
+    char* saveptr;
+    char* p = strtok_r(s, "{}\",: ", &saveptr);
     while(p && m->m.len < 20) {
         m->m.keys[m->m.len] = strdup(p);
-        p = strtok(NULL, "{}\",: ");
+        if (current_web_ctx) volt_track_alloc_raw(m->m.keys[m->m.len]);
+        p = strtok_r(NULL, "{}\",: ", &saveptr);
         if (p) {
             if (isdigit(*p)) m->m.values[m->m.len++] = make_int(atoll(p));
             else m->m.values[m->m.len++] = make_str(p);
         }
-        p = strtok(NULL, "{}\",: ");
+        p = strtok_r(NULL, "{}\",: ", &saveptr);
     }
     free(s);
     return m;
@@ -493,11 +588,175 @@ void* volt_rb_pop(VoltRingBuffer* rb) {
 }
 
 // Routing Logic
-typedef struct Route { char* path; void (*handler)(void*); bool is_ws; } Route;
-typedef struct Router { char* name; Route routes[100]; int count; void (*before)(void*); } Router;
+typedef struct Route { char* path; void (*handler)(VoltContext*); bool is_ws; } Route;
+typedef struct Router { char* name; Route routes[100]; int count; void (*before)(VoltContext*); } Router;
+
+VoltValue* volt_request_header(const char* name) {
+    if (!current_web_ctx) return make_str("");
+    for(int i=0; i<current_web_ctx->header_count; i++) {
+        if (strncasecmp(current_web_ctx->headers[i], name, strlen(name)) == 0) {
+            char* val = strchr(current_web_ctx->headers[i], ':');
+            if (val) return make_str(val + 2);
+        }
+    }
+    return make_str("");
+}
+
+void volt_redirect(const char* url) {
+    if (!current_web_ctx) return;
+    current_web_ctx->status = 302;
+    char buf[512];
+    sprintf(buf, "Location: %s\r\n", url);
+    current_web_ctx->headers[current_web_ctx->header_count++] = strdup(buf);
+}
+
+VoltValue* volt_json(VoltValue* v) {
+    if (!current_web_ctx) return v;
+    current_web_ctx->headers[current_web_ctx->header_count++] = strdup("Content-Type: application/json\r\n");
+    volt_buf_append_json(current_web_ctx->response_body, v);
+    return v;
+}
+
+
+VoltValue* volt_request_form(const char* key) {
+    if (!current_web_ctx || !current_web_ctx->request_body) return make_str("");
+    char* body_copy = strdup(current_web_ctx->request_body);
+    char* saveptr1, *saveptr2;
+    char* pair = strtok_r(body_copy, "&", &saveptr1);
+    while(pair) {
+        char* k = strtok_r(pair, "=", &saveptr2);
+        char* v = strtok_r(NULL, "=", &saveptr2);
+        if (k && v && strcmp(k, key) == 0) {
+            VoltValue* rv = make_str(v);
+            free(body_copy);
+            return rv;
+        }
+        pair = strtok_r(NULL, "&", &saveptr1);
+    }
+    free(body_copy);
+    return make_str("");
+}
+
+VoltValue* volt_request_json() {
+    if (!current_web_ctx || !current_web_ctx->request_body) return json_parse("{}");
+    return json_parse(current_web_ctx->request_body);
+}
+
+typedef struct { Router* r; int client_fd; } ConnTaskArgs;
+
+void volt_dispatch_route(void* arg) {
+    ConnTaskArgs* args = (ConnTaskArgs*)arg;
+    VoltContext* ctx = malloc(sizeof(VoltContext));
+    ctx->client_fd = args->client_fd;
+    ctx->status = 200;
+    ctx->is_fragment = false;
+    ctx->header_count = 0;
+    ctx->alloc_count = 0;
+    ctx->alloc_cap = 128;
+    ctx->allocations = malloc(ctx->alloc_cap * sizeof(void*));
+    ctx->response_body = volt_buf_new();
+    ctx->request_body = NULL;
+    ctx->method = NULL;
+    ctx->path = NULL;
+    current_web_ctx = ctx;
+
+    char buffer[4096];
+    int n = read(ctx->client_fd, buffer, 4095);
+    if (n > 0) {
+        buffer[n] = '\0';
+        char* body_ptr = strstr(buffer, "\r\n\r\n");
+        if (body_ptr) {
+            *body_ptr = '\0';
+            ctx->request_body = strdup(body_ptr + 4);
+        }
+        char* saveptr;
+        char* method_str = strtok_r(buffer, " ", &saveptr);
+        char* path_str = strtok_r(NULL, " ", &saveptr);
+        ctx->method = strdup(method_str ? method_str : "GET");
+        ctx->path = strdup(path_str ? path_str : "/");
+
+        Route* target = NULL;
+        for(int i=0; i<args->r->count; i++) {
+            if (strcmp(args->r->routes[i].path, ctx->path) == 0) {
+                target = &args->r->routes[i];
+                break;
+            }
+        }
+
+        if (args->r->before) args->r->before(ctx);
+
+        if (target) {
+            if (target->is_ws) {
+                write(ctx->client_fd, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", 78);
+                target->handler(ctx);
+            } else {
+                target->handler(ctx);
+                fflush(stdout);
+                if (ctx->status == 302) {
+                    char header[512];
+                    sprintf(header, "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n");
+                    write(ctx->client_fd, header, strlen(header));
+                    for(int i=0; i<ctx->header_count; i++) write(ctx->client_fd, ctx->headers[i], strlen(ctx->headers[i]));
+                    write(ctx->client_fd, "\r\n", 2);
+                } else if (ctx->is_fragment) {
+                    write(ctx->client_fd, ctx->response_body->data, ctx->response_body->len);
+                } else {
+                    char header[512];
+                    sprintf(header, "HTTP/1.1 %d OK\r\nContent-Length: %zu\r\n", ctx->status, ctx->response_body->len);
+                    write(ctx->client_fd, header, strlen(header));
+                    for(int i=0; i<ctx->header_count; i++) write(ctx->client_fd, ctx->headers[i], strlen(ctx->headers[i]));
+                    write(ctx->client_fd, "\r\n", 2);
+                    write(ctx->client_fd, ctx->response_body->data, ctx->response_body->len);
+                }
+            }
+        } else {
+            write(ctx->client_fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found", 53);
+        }
+        free(ctx->method); free(ctx->path);
+    }
+cleanup:
+    close(ctx->client_fd);
+    volt_buf_free(ctx->response_body);
+    if (ctx->request_body) free(ctx->request_body);
+    if (ctx->method) free(ctx->method);
+    if (ctx->path) free(ctx->path);
+    for(int i=0; i<ctx->header_count; i++) free(ctx->headers[i]);
+    for(int i=0; i<ctx->alloc_count; i++) free(ctx->allocations[i]);
+    if (ctx->allocations) free(ctx->allocations);
+    free(ctx);
+    free(args);
+}
+
+void* volt_accept_loop(void* arg) {
+    Router* r = (Router*)arg;
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(8080) };
+    int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        return NULL;
+    }
+    if (listen(server_fd, 100) < 0) {
+        perror("listen failed");
+        return NULL;
+    }
+    while(1) {
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) {
+            perror("accept failed");
+            continue;
+        }
+        ConnTaskArgs* args = malloc(sizeof(ConnTaskArgs));
+        args->r = r; args->client_fd = client;
+        schedule_task(rand() % NUM_WORKERS, volt_dispatch_route, args);
+    }
+    return NULL;
+}
 
 void volt_start_web_server(Router* r, int port) {
-    printf("Web server '%s' started on port %d with %d routes\n", r->name, port, r->count);
+    pthread_t t;
+    pthread_create(&t, NULL, volt_accept_loop, r);
+    printf("KS-Panel Engine: Web server '%s' started on port %d\n", r->name, port);
 }
 
 void volt_set_value(VoltValue** dest, VoltValue* src) {
@@ -532,8 +791,10 @@ const char* to_str(VoltValue* v) {
 		sb.WriteString("VoltValue* " + v + ";\n")
 	}
 
+	sb.WriteString(c.extraFuncs.String())
 	sb.WriteString(funcs.String())
 	sb.WriteString("\nint main(int argc, char** argv) {\n")
+	sb.WriteString("    setvbuf(stdout, NULL, _IONBF, 0);\n")
 	sb.WriteString("    srand(time(NULL));\n")
 	if c.PythonNeeded {
 		sb.WriteString("    Py_Initialize();\n")
@@ -556,6 +817,7 @@ const char* to_str(VoltValue* v) {
 }
 
 func (c *Compiler) collectGlobalVars(program *ast.Program) {
+	processed := make(map[string]bool)
 	var walker func(node interface{})
 	walker = func(node interface{}) {
 		if node == nil {
@@ -571,6 +833,8 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			walker(n.Value)
 		case *ast.FunctionStatement:
 			c.globalVars[n.Name.Value] = true
+			walker(n.Body)
+		case *ast.ComponentDefinition:
 			walker(n.Body)
 		case *ast.BlockStatement:
 			for _, s := range n.Statements {
@@ -596,6 +860,21 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			}
 		case *ast.SpawnStatement:
 			walker(n.Body)
+		case *ast.WebBlockStatement:
+			for _, s := range n.Body.Statements {
+				switch r := s.(type) {
+				case *ast.PathStatement:
+					walker(r.Body)
+				case *ast.PathWsStatement:
+					walker(r.Body)
+				case *ast.BeforeEachStatement:
+					walker(r.Body)
+				}
+			}
+		case *ast.DispatchJobStatement:
+			walker(n.Body)
+		case *ast.ImportComponentStatement:
+			c.collectFromImport(n.Path, processed, walker)
 		case *ast.InfixExpression:
 			walker(n.Left)
 			walker(n.Right)
@@ -621,6 +900,28 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 		}
 	}
 	walker(program)
+}
+
+func (c *Compiler) collectFromImport(path string, processed map[string]bool, walker func(interface{})) {
+	if strings.Contains(path, "*") {
+		matches, _ := filepath.Glob(path)
+		for _, m := range matches {
+			c.collectFromImport(m, processed, walker)
+		}
+		return
+	}
+	if processed[path] {
+		return
+	}
+	processed[path] = true
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	subL := lexer.New(string(data))
+	subP := parser.New(subL)
+	subProg := subP.ParseProgram()
+	walker(subProg)
 }
 
 func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder, indent string) string {
@@ -785,6 +1086,15 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 	case *ast.ImportComponentStatement:
 		c.processImport(s.Path, s.Alias.Value, funcs)
 		return ""
+	case *ast.RenderFragmentStatement:
+		return indent + "if (current_web_ctx) { current_web_ctx->is_fragment = true; volt_buf_free(current_web_ctx->response_body); current_web_ctx->response_body = volt_buf_new(); ctx->response_body = current_web_ctx->response_body; }\n"
+	case *ast.DispatchJobStatement:
+		id := strconv.Itoa(c.funcID)
+		c.funcID++
+		c.extraFuncs.WriteString("void volt_job_" + id + "(void* arg) {\n")
+		c.extraFuncs.WriteString(c.transpileStatement(s.Body, funcs, "    "))
+		c.extraFuncs.WriteString("}\n")
+		return indent + "schedule_task(rand() % NUM_WORKERS, volt_job_" + id + ", NULL);\n"
 	case *ast.WebBlockStatement:
 		name := s.Name
 		if name == "" {
@@ -797,24 +1107,30 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 			case *ast.PathStatement:
 				handlerName := "handler_" + strconv.Itoa(c.funcID)
 				c.funcID++
-				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				c.isInWebRoute = false
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
 					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", false }; }\n")
 			case *ast.PathWsStatement:
 				handlerName := "handler_" + strconv.Itoa(c.funcID)
 				c.funcID++
-				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				c.isInWebRoute = false
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
 					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", true }; }\n")
 			case *ast.BeforeEachStatement:
 				handlerName := "before_" + name + "_" + strconv.Itoa(c.funcID)
 				c.funcID++
-				funcs.WriteString("void " + handlerName + "(void* arg) {\n")
+				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
+				c.isInWebRoute = false
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " + routerName + ".before = " + handlerName + "; }\n")
 			}
@@ -888,6 +1204,13 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 					}
 				}
 			}
+		} else if c.isInWebRoute {
+			if is, ok := s.Expression.(*ast.InterpolatedStringLiteral); ok {
+				return c.transpileToBuffer(is, "current_web_ctx->response_body", indent)
+			}
+			if sl, ok := s.Expression.(*ast.StringLiteral); ok {
+				return indent + "volt_buf_append(current_web_ctx->response_body, \"" + sl.Value + "\");\n"
+			}
 		}
 		code, isTemp := c.transpileExpression(s.Expression)
 		if isTemp {
@@ -923,9 +1246,9 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 	case *ast.SpawnStatement:
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
-		funcs.WriteString("void volt_func_" + id + "(void* arg) {\n")
-		funcs.WriteString(c.transpileStatement(s.Body, funcs, "    "))
-		funcs.WriteString("}\n")
+		c.extraFuncs.WriteString("void volt_func_" + id + "(void* arg) {\n")
+		c.extraFuncs.WriteString(c.transpileStatement(s.Body, funcs, "    "))
+		c.extraFuncs.WriteString("}\n")
 		if s.Name.Value == "connect_bot" {
 			code0, isTemp0 := c.transpileExpression(s.Args[0])
 			code1, isTemp1 := c.transpileExpression(s.Args[1])
@@ -961,6 +1284,16 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 }
 
 func (c *Compiler) processImport(path string, aliasPrefix string, funcs *strings.Builder) {
+	if strings.Contains(path, "*") {
+		matches, _ := filepath.Glob(path)
+		for _, m := range matches {
+			ext := filepath.Ext(m)
+			base := filepath.Base(m)
+			name := base[:len(base)-len(ext)]
+			c.processImport(m, aliasPrefix+"_"+name+"_", funcs)
+		}
+		return
+	}
 	if c.importedFiles[path] {
 		return
 	}
@@ -977,20 +1310,24 @@ func (c *Compiler) processImport(path string, aliasPrefix string, funcs *strings
 	subProg := subP.ParseProgram()
 
 	oldPrefix := c.curPrefix
-	c.curPrefix = aliasPrefix
+	if aliasPrefix != "" && !strings.HasSuffix(aliasPrefix, "_") {
+		c.curPrefix = aliasPrefix + "_"
+	} else {
+		c.curPrefix = aliasPrefix
+	}
 
 	for _, subStmt := range subProg.Statements {
 		switch st := subStmt.(type) {
 		case *ast.ComponentDefinition:
 			originalName := st.Name.Value
-			fullName := aliasPrefix + originalName
+			fullName := strings.ReplaceAll(c.curPrefix+originalName, ".", "_")
 			st.Name.Value = fullName
 			c.components[fullName] = true
 			c.ComponentAliases[fullName] = st.Name.Value
 			c.transpileStatement(st, funcs, "")
 			st.Name.Value = originalName
 		case *ast.ImportComponentStatement:
-			c.processImport(st.Path, aliasPrefix+st.Alias.Value, funcs)
+			c.processImport(st.Path, c.curPrefix+st.Alias.Value, funcs)
 		}
 	}
 	c.curPrefix = oldPrefix
@@ -1022,6 +1359,22 @@ func (c *Compiler) transpileToBuffer(expr ast.Expression, bufName string, indent
 		return indent + "{ VoltValue* _tmp = " + code + "; volt_buf_append_value(" + bufName + ", _tmp); volt_value_free(_tmp); }\n"
 	}
 	return indent + "volt_buf_append_value(" + bufName + ", " + code + ");\n"
+}
+
+func (c *Compiler) getMethodFullName(e *ast.MethodCallExpression) string {
+	var parts []string
+	var walk func(exp ast.Expression)
+	walk = func(exp ast.Expression) {
+		switch node := exp.(type) {
+		case *ast.Identifier:
+			parts = append(parts, node.Value)
+		case *ast.MethodCallExpression:
+			walk(node.Object)
+			parts = append(parts, node.Method.Value)
+		}
+	}
+	walk(e)
+	return strings.Join(parts, "_")
 }
 
 func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
@@ -1129,35 +1482,39 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 		}
 		return "dynamic_add(" + lArg + ", " + rArg + ")", true
 	case *ast.MethodCallExpression:
-		objIdent, ok := e.Object.(*ast.Identifier)
-		if ok {
-			fullName := c.curPrefix + objIdent.Value + e.Method.Value
-			if c.components[fullName] {
-				args := []string{}
-				for _, arg := range e.Arguments {
-					code, isTemp := c.transpileExpression(arg)
-					if isTemp {
-						args = append(args, code)
-					} else {
-						args = append(args, "volt_value_copy("+code+")")
-					}
-				}
-				argv := "NULL"
-				if len(args) > 0 {
-					argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
-					for i, arg := range args {
-						argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
-					}
-					argv += " v; })"
-				}
-				ctxParam := "NULL"
-				if c.curComponent != "" {
-					ctxParam = "ctx"
+		plainName := c.getMethodFullName(e)
+		fullName := ""
+		if c.components[plainName] {
+			fullName = plainName
+		} else if c.components[c.curPrefix+plainName] {
+			fullName = c.curPrefix + plainName
+		}
+
+		if fullName != "" {
+			args := []string{}
+			for _, arg := range e.Arguments {
+				code, isTemp := c.transpileExpression(arg)
+				if isTemp {
+					args = append(args, code)
 				} else {
-					return "({ VoltBuffer* _b = volt_buf_new(); render_" + fullName + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); make_str(\"\"); })", true
+					args = append(args, "volt_value_copy("+code+")")
 				}
-				return "({ render_" + fullName + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })", true
 			}
+			argv := "NULL"
+			if len(args) > 0 {
+				argv = "({ VoltValue** v = malloc(" + strconv.Itoa(len(args)) + " * sizeof(VoltValue*)); "
+				for i, arg := range args {
+					argv += "v[" + strconv.Itoa(i) + "] = " + arg + "; "
+				}
+				argv += " v; })"
+			}
+			ctxParam := "NULL"
+			if c.curComponent != "" {
+				ctxParam = "ctx"
+			} else {
+				return "({ VoltBuffer* _b = volt_buf_new(); render_" + fullName + "(_b, " + strconv.Itoa(len(args)) + ", " + argv + "); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); make_str(\"\"); })", true
+			}
+			return "({ render_" + fullName + "(" + ctxParam + ", " + strconv.Itoa(len(args)) + ", " + argv + "); make_str(\"\"); })", true
 		}
 
 		obj, objTemp := c.transpileExpression(e.Object)
@@ -1178,6 +1535,8 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 
 		if nameIdent, ok := e.Function.(*ast.Identifier); ok {
 			name = nameIdent.Value
+		} else if mce, ok := e.Function.(*ast.MethodCallExpression); ok {
+			name = c.getMethodFullName(mce)
 		} else {
 			funcCode, isFuncTemp = c.transpileExpression(e.Function)
 		}
@@ -1211,12 +1570,12 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 
 		compName := ""
 		if name != "" {
-			if c.components[c.curPrefix+name] {
+			if c.components[name] {
+				compName = name
+			} else if c.components[c.curPrefix+name] {
 				compName = c.curPrefix + name
 			} else if alias, ok := c.ComponentAliases[name]; ok {
 				compName = alias
-			} else if c.components[name] {
-				compName = name
 			}
 		}
 
@@ -1224,16 +1583,31 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 			ctxParam := "NULL"
 			if c.curComponent != "" {
 				ctxParam = "ctx"
+			} else if c.isInWebRoute {
+				ctxParam = "current_web_ctx->response_body"
 			} else {
 				res += "VoltBuffer* _b = volt_buf_new(); render_" + compName + "(_b, " + strconv.Itoa(len(argCodes)) + ", _argv); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); "
 			}
-			if c.curComponent != "" {
+			if c.curComponent != "" || c.isInWebRoute {
 				res += "render_" + compName + "(" + ctxParam + ", " + strconv.Itoa(len(argCodes)) + ", _argv); "
 			}
 		} else if name != "" {
 			switch name {
 			case "print":
 				res += "printf(\"%s\\n\", to_str(_a0)); "
+			case "request_header":
+				res += "_rv = volt_request_header(to_str(_a0)); "
+			case "redirect":
+				res += "volt_redirect(to_str(_a0)); "
+				if c.isInWebRoute {
+					res += "return make_str(\"\"); "
+				}
+			case "json":
+				res += "_rv = volt_json(_a0); "
+			case "request_form":
+				res += "_rv = volt_request_form(to_str(_a0)); "
+			case "request_json":
+				res += "_rv = volt_request_json(); "
 			case "json_parse":
 				res += "_rv = json_parse(to_str(_a0)); "
 			case "db_save":
@@ -1254,10 +1628,12 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 					ctxParam := "NULL"
 					if c.curComponent != "" {
 						ctxParam = "ctx"
+					} else if c.isInWebRoute {
+						ctxParam = "current_web_ctx->response_body"
 					} else {
 						res += "VoltBuffer* _b = volt_buf_new(); render_" + cName + "(_b, " + strconv.Itoa(len(argCodes)) + ", _argv); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); "
 					}
-					if c.curComponent != "" {
+					if c.curComponent != "" || c.isInWebRoute {
 						res += "render_" + cName + "(" + ctxParam + ", " + strconv.Itoa(len(argCodes)) + ", _argv); "
 					}
 				} else {

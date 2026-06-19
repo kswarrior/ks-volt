@@ -86,6 +86,10 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parsePathWsStatement()
 	case token.BEFORE_EACH:
 		return p.parseBeforeEachStatement()
+	case token.RENDER_FRAGMENT:
+		return p.parseRenderFragmentStatement()
+	case token.DISPATCH_JOB:
+		return p.parseDispatchJobStatement()
 	case token.IMPORT:
 		return p.parseImportStatement()
 	case token.EXPORT:
@@ -112,6 +116,39 @@ func (p *Parser) parseFunctionStatement() *ast.FunctionStatement {
 		return nil
 	}
 	stmt.Parameters = p.parseFunctionParameters()
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	stmt.Body = p.parseBlockStatement()
+	return stmt
+}
+
+func (p *Parser) parseRenderFragmentStatement() *ast.RenderFragmentStatement {
+	stmt := &ast.RenderFragmentStatement{Token: p.curToken}
+	if p.peekToken.Type == token.LPAREN {
+		p.nextToken()
+		if !p.expectPeek(token.RPAREN) {
+			return nil
+		}
+	}
+	return stmt
+}
+
+func (p *Parser) parseDispatchJobStatement() *ast.DispatchJobStatement {
+	stmt := &ast.DispatchJobStatement{Token: p.curToken}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	stmt.Arguments = p.parseCallArguments()
+	if len(stmt.Arguments) > 0 {
+		if ident, ok := stmt.Arguments[0].(*ast.Identifier); ok {
+			stmt.Name = ident
+			stmt.Arguments = stmt.Arguments[1:]
+		}
+	}
+	if p.peekToken.Type == token.ARROW {
+		p.nextToken()
+	}
 	if !p.expectPeek(token.LBRACE) {
 		return nil
 	}
@@ -177,9 +214,11 @@ func (p *Parser) parseMatchResultStatement() *ast.MatchResultStatement {
 	if !p.expectPeek(token.LPAREN) {
 		return nil
 	}
-	if !p.expectPeek(token.IDENT) {
+	if p.peekToken.Type != token.IDENT && p.peekToken.Type != token.ERR {
+		p.peekError(token.IDENT)
 		return nil
 	}
+	p.nextToken()
 	stmt.OkVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	if !p.expectPeek(token.RPAREN) {
 		return nil
@@ -322,9 +361,11 @@ func (p *Parser) parseTryCatchStatement() *ast.TryCatchStatement {
 	if !p.expectPeek(token.LPAREN) {
 		return nil
 	}
-	if !p.expectPeek(token.IDENT) {
+	if p.peekToken.Type != token.IDENT && p.peekToken.Type != token.ERR {
+		p.peekError(token.IDENT)
 		return nil
 	}
+	p.nextToken()
 	stmt.CatchVariable = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	if !p.expectPeek(token.RPAREN) {
 		return nil
@@ -507,7 +548,7 @@ func (p *Parser) parseExpression(precedence int) ast.Expression {
 		leftExp = p.parseResultLiteral()
 	case token.AMPERSAND:
 		leftExp = p.parseBorrowExpression()
-	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR:
+	case token.PRINT, token.SERVE_HTML, token.FETCH_API, token.DB_SAVE, token.DB_GET, token.JSON_PARSE, token.FILE_WRITE, token.EMIT, token.GET_ADDR, token.REQUEST_FORM, token.REQUEST_JSON:
 		leftExp = &ast.Identifier{Token: p.curToken, Value: p.curToken.Literal}
 	default:
 		return nil
@@ -543,6 +584,11 @@ func (p *Parser) parseMethodCallExpression(object ast.Expression) ast.Expression
 	if p.peekToken.Type == token.LPAREN {
 		p.nextToken()
 		exp.Arguments = p.parseCallArguments()
+	}
+	// Allow chaining for Namespace.File.Component
+	if p.peekToken.Type == token.DOT {
+		p.nextToken()
+		return p.parseMethodCallExpression(exp)
 	}
 	return exp
 }
