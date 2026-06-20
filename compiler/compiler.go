@@ -30,6 +30,7 @@ type Compiler struct {
 	SourceLines      []string
 	webBlocks        []string
 	isInWebRoute     bool
+	HasNetworking    bool
 	extraFuncs       strings.Builder
 }
 
@@ -139,9 +140,17 @@ func (c *Compiler) Compile(program *ast.Program) string {
 #include <sys/stat.h>
 #include <dirent.h>
 #include <stdatomic.h>
+#include <stddef.h>
+#include <ucontext.h>
+#include <sys/epoll.h>
+#include <dlfcn.h>
+
+struct VoltGreenThread;
+extern __thread struct VoltGreenThread* current_green_thread;
 
 #define MAX_TASKS 8192
 #define NUM_WORKERS 4
+#define STACK_SIZE 65536
 
 typedef enum { TYPE_STR, TYPE_INT, TYPE_BOOL, TYPE_ARRAY, TYPE_MAP, TYPE_FN, TYPE_RESULT } VoltType;
 
@@ -152,12 +161,16 @@ typedef struct VoltBuffer {
     char* data;
     size_t len;
     size_t cap;
+    size_t high_watermark;
+    bool paused;
 } VoltBuffer;
 
 VoltBuffer* volt_buf_new() {
     VoltBuffer* b = malloc(sizeof(VoltBuffer));
     b->cap = 4096; b->len = 0; b->data = malloc(b->cap);
     b->data[0] = '\0';
+    b->high_watermark = 1024 * 1024;
+    b->paused = false;
     return b;
 }
 
@@ -175,6 +188,13 @@ void volt_buf_append(VoltBuffer* b, const char* s) {
     memcpy(b->data + b->len, s, slen);
     b->len += slen;
     b->data[b->len] = '\0';
+
+    if (b->len > b->high_watermark && current_green_thread) {
+        b->paused = true;
+        // In Node.js, we yield here. We'll resume when kernel drains.
+        // For our simplified implementation, we yield to allow other tasks to run.
+        volt_scheduler_yield();
+    }
 }
 
 void volt_buf_free(VoltBuffer* b) {
@@ -197,22 +217,102 @@ typedef struct VoltValue {
     };
 } VoltValue;
 
-typedef struct Task {
+typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
+
+typedef struct VoltGreenThread {
+    ucontext_t context;
+    void* stack;
     void (*func)(void*);
     void* arg;
-} Task;
+    int fd;
+    ThreadState state;
+} VoltGreenThread;
+
+extern __thread VoltGreenThread* current_green_thread;
 
 typedef struct {
-    Task queue[MAX_TASKS];
+    VoltGreenThread* queue[MAX_TASKS];
     int head, tail;
     pthread_mutex_t lock;
+    ucontext_t worker_context;
 } Processor;
 
 Processor processors[NUM_WORKERS];
 pthread_t workers[NUM_WORKERS];
 __thread int worker_id;
-__thread jmp_buf* current_jmp_env;
+__thread VoltGreenThread* current_green_thread = NULL;
+
+struct Router;
+
+typedef struct KVFrame {
+    const char* func_name;
+    const char* file;
+    int line;
+    jmp_buf env;
+} KVFrame;
+
+#define MAX_FRAMES 128
+extern __thread KVFrame kv_frame_stack[MAX_FRAMES];
+extern __thread int kv_frame_ptr;
+
+__thread KVFrame kv_frame_stack[MAX_FRAMES];
+__thread int kv_frame_ptr = -1;
+
+void kv_push_frame(const char* fn, const char* file, int line) {
+    if (kv_frame_ptr < MAX_FRAMES - 1) {
+        kv_frame_ptr++;
+        kv_frame_stack[kv_frame_ptr].func_name = fn;
+        kv_frame_stack[kv_frame_ptr].file = file;
+        kv_frame_stack[kv_frame_ptr].line = line;
+    }
+}
+
+void kv_pop_frame() {
+    if (kv_frame_ptr >= 0) kv_frame_ptr--;
+}
+
+void kv_backtrace() {
+    printf("--- KV Backtrace ---\n");
+    for (int i = kv_frame_ptr; i >= 0; i--) {
+        printf("  at %s (%s:%d)\n", kv_frame_stack[i].func_name, kv_frame_stack[i].file, kv_frame_stack[i].line);
+    }
+}
+
+#define KV_ENTER_FRAME(fn, file, line) kv_push_frame(fn, file, line); if (setjmp(kv_frame_stack[kv_frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
+#define KV_EXIT_FRAME() kv_pop_frame();
+
+void volt_plugin_register(const char* path, struct Router* r) {
+    void* handle = dlopen(path, RTLD_NOW);
+    if (!handle) { printf("Plugin error: %s\n", dlerror()); return; }
+    void (*init)(struct Router*) = dlsym(handle, "volt_plugin_init");
+    if (init) init(r);
+}
+
 pthread_mutex_t db_file_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int global_epoll_fd;
+
+void volt_netpoller_init() {
+    global_epoll_fd = epoll_create1(0);
+}
+
+void volt_scheduler_yield() {
+    if (current_green_thread) {
+        swapcontext(&current_green_thread->context, &processors[worker_id].worker_context);
+    }
+}
+
+void volt_poller_loop(void* arg) {
+    struct epoll_event events[64];
+    while (1) {
+        int nfds = epoll_wait(global_epoll_fd, events, 64, 10);
+        for (int i = 0; i < nfds; i++) {
+            VoltGreenThread* t = (VoltGreenThread*)events[i].data.ptr;
+            t->state = THREAD_READY;
+            enqueue_thread(rand() % NUM_WORKERS, t);
+        }
+    }
+}
 
 typedef struct {
     int client_fd;
@@ -247,31 +347,57 @@ void* volt_track_alloc(size_t size) {
     return volt_track_alloc_raw(ptr);
 }
 
-void schedule_task(int p_id, void (*func)(void*), void* arg) {
+void volt_green_thread_entry();
+
+void enqueue_thread(int p_id, VoltGreenThread* t) {
     Processor* p = &processors[p_id];
     pthread_mutex_lock(&p->lock);
     int next = (p->tail + 1) % MAX_TASKS;
     if (next != p->head) {
-        p->queue[p->tail].func = func;
-        p->queue[p->tail].arg = arg;
+        p->queue[p->tail] = t;
         p->tail = next;
     }
     pthread_mutex_unlock(&p->lock);
+}
+
+void schedule_task(int p_id, void (*func)(void*), void* arg) {
+    VoltGreenThread* t = malloc(sizeof(VoltGreenThread));
+    t->func = func;
+    t->arg = arg;
+    t->state = THREAD_READY;
+    t->fd = -1;
+    t->stack = malloc(STACK_SIZE);
+
+    getcontext(&t->context);
+    t->context.uc_stack.ss_sp = t->stack;
+    t->context.uc_stack.ss_size = STACK_SIZE;
+    t->context.uc_link = NULL;
+    makecontext(&t->context, (void(*)())volt_green_thread_entry, 1, t);
+
+    enqueue_thread(p_id, t);
 }
 
 void* worker_loop(void* arg) {
     worker_id = *(int*)arg;
     while (1) {
         Processor* p = &processors[worker_id];
-        Task t = {NULL, NULL};
+        VoltGreenThread* t = NULL;
         pthread_mutex_lock(&p->lock);
         if (p->head != p->tail) {
             t = p->queue[p->head];
             p->head = (p->head + 1) % MAX_TASKS;
         }
         pthread_mutex_unlock(&p->lock);
-        if (t.func) {
-            t.func(t.arg);
+
+        if (t) {
+            t->state = THREAD_RUNNING;
+            current_green_thread = t;
+            swapcontext(&p->worker_context, &t->context);
+            current_green_thread = NULL;
+            if (t->state == THREAD_FINISHED) {
+                free(t->stack);
+                free(t);
+            }
             malloc_trim(0);
         } else {
             int target = rand() % NUM_WORKERS;
@@ -282,12 +408,27 @@ void* worker_loop(void* arg) {
                     processors[target].head = (processors[target].head + 1) % MAX_TASKS;
                 }
                 pthread_mutex_unlock(&processors[target].lock);
-                if (t.func) t.func(t.arg);
+                if (t) {
+                    t->state = THREAD_RUNNING;
+                    current_green_thread = t;
+                    swapcontext(&p->worker_context, &t->context);
+                    current_green_thread = NULL;
+                    if (t->state == THREAD_FINISHED) {
+                        free(t->stack);
+                        free(t);
+                    }
+                }
             }
             usleep(1000);
         }
     }
     return NULL;
+}
+
+void volt_green_thread_entry(VoltGreenThread* t) {
+    t->func(t->arg);
+    t->state = THREAD_FINISHED;
+    setcontext(&processors[worker_id].worker_context);
 }
 
 // Runtime Primitives
@@ -493,7 +634,14 @@ VoltValue* db_get(const char* key) { return make_str("ready"); }
 void volt_file_write(const char* fn, const char* data) {
     pthread_mutex_lock(&db_file_lock);
     FILE* f = fopen(fn, "w");
-    if (!f) { pthread_mutex_unlock(&db_file_lock); if (current_jmp_env) longjmp(*current_jmp_env, 1); return; }
+    if (!f) {
+        pthread_mutex_unlock(&db_file_lock);
+        if (kv_frame_ptr >= 0) {
+            kv_backtrace();
+            longjmp(kv_frame_stack[kv_frame_ptr].env, 1);
+        }
+        return;
+    }
     fputs(data, f); fclose(f);
     pthread_mutex_unlock(&db_file_lock);
 }
@@ -543,9 +691,19 @@ void start_interval(int ms, void (*func)(void*)) {
     pthread_t t; pthread_create(&t, NULL, interval_runner, arg);
 }
 
+// Platform Abstraction Layer (PAL)
+#ifdef _WIN32
+#include <windows.h>
+#define KV_FS_REMOVE(p) DeleteFile(p)
+#define KV_FS_RENAME(s, d) MoveFile(s, d)
+#else
+#define KV_FS_REMOVE(p) unlink(p)
+#define KV_FS_RENAME(s, d) rename(s, d)
+#endif
+
 // FS Shortcuts
-void fs_rm(const char* path) { unlink(path); }
-void fs_mv(const char* src, const char* dst) { rename(src, dst); }
+void fs_rm(const char* path) { KV_FS_REMOVE(path); }
+void fs_mv(const char* src, const char* dst) { KV_FS_RENAME(src, dst); }
 void fs_touch(const char* path) { FILE* f = fopen(path, "a"); if(f) fclose(f); }
 void fs_cat(const char* path) {
     FILE* f = fopen(path, "r");
@@ -588,8 +746,8 @@ void* volt_rb_pop(VoltRingBuffer* rb) {
 }
 
 // Routing Logic
-typedef struct Route { char* path; void (*handler)(VoltContext*); bool is_ws; } Route;
-typedef struct Router { char* name; Route routes[100]; int count; void (*before)(VoltContext*); } Router;
+typedef struct Route { char* path; void (*handler)(struct VoltContext*); bool is_ws; } Route;
+typedef struct Router { char* name; Route routes[100]; int count; void (*before)(struct VoltContext*); } Router;
 
 VoltValue* volt_request_header(const char* name) {
     if (!current_web_ctx) return make_str("");
@@ -660,8 +818,20 @@ void volt_dispatch_route(void* arg) {
     ctx->path = NULL;
     current_web_ctx = ctx;
 
+    int flags = fcntl(ctx->client_fd, F_GETFL, 0);
+    fcntl(ctx->client_fd, F_SETFL, flags | O_NONBLOCK);
+
     char buffer[4096];
-    int n = read(ctx->client_fd, buffer, 4095);
+    int n;
+    while ((n = read(ctx->client_fd, buffer, 4095)) < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            struct epoll_event ev = { .events = EPOLLIN | EPOLLONESHOT, .data.ptr = current_green_thread };
+            epoll_ctl(global_epoll_fd, EPOLL_CTL_ADD, ctx->client_fd, &ev);
+            current_green_thread->state = THREAD_PARKED;
+            volt_scheduler_yield();
+        } else break;
+    }
+
     if (n > 0) {
         buffer[n] = '\0';
         char* body_ptr = strstr(buffer, "\r\n\r\n");
@@ -740,9 +910,18 @@ void* volt_accept_loop(void* arg) {
         perror("listen failed");
         return NULL;
     }
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
     while(1) {
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // In a real netpoller, the accept loop would be a green thread too.
+                // For now, we use a simple usleep to prevent busy waiting in this background thread.
+                usleep(1000);
+                continue;
+            }
             perror("accept failed");
             continue;
         }
@@ -754,9 +933,11 @@ void* volt_accept_loop(void* arg) {
 }
 
 void volt_start_web_server(Router* r, int port) {
-    pthread_t t;
-    pthread_create(&t, NULL, volt_accept_loop, r);
-    printf("KS-Panel Engine: Web server '%s' started on port %d\n", r->name, port);
+    volt_netpoller_init();
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, volt_accept_loop, r);
+    pthread_create(&t2, NULL, (void* (*)(void*))volt_poller_loop, NULL);
+    printf("KS-Panel Engine: Web server '%s' started on port %d with Netpoller\n", r->name, port);
 }
 
 void volt_set_value(VoltValue** dest, VoltValue* src) {
@@ -795,6 +976,29 @@ const char* to_str(VoltValue* v) {
 	sb.WriteString(funcs.String())
 	sb.WriteString("\nint main(int argc, char** argv) {\n")
 	sb.WriteString("    setvbuf(stdout, NULL, _IONBF, 0);\n")
+
+	if !c.HasNetworking {
+		sb.WriteString(`    // Seccomp Sandbox: Networking disabled
+    #include <linux/seccomp.h>
+    #include <linux/filter.h>
+    #include <sys/prctl.h>
+    #include <sys/syscall.h>
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_socket, 0, 1),
+        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_bind, 0, 1),
+        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
+        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_listen, 0, 1),
+        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
+        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = { .len = (unsigned short)(sizeof(filter)/sizeof(filter[0])), .filter = filter };
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+`)
+	}
+
 	sb.WriteString("    srand(time(NULL));\n")
 	if c.PythonNeeded {
 		sb.WriteString("    Py_Initialize();\n")
@@ -861,6 +1065,7 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 		case *ast.SpawnStatement:
 			walker(n.Body)
 		case *ast.WebBlockStatement:
+			c.HasNetworking = true
 			for _, s := range n.Body.Statements {
 				switch r := s.(type) {
 				case *ast.PathStatement:
@@ -1074,12 +1279,15 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		c.curComponent = s.Name.Value
 		fName := "render_" + s.Name.Value
 		funcs.WriteString("void " + fName + "(VoltBuffer* ctx, int argc, VoltValue** argv) {\n")
+		funcs.WriteString("    kv_push_frame(\"" + s.Name.Value + "\", \"component\", 0);\n")
+		funcs.WriteString("    if (setjmp(kv_frame_stack[kv_frame_ptr].env) != 0) { kv_pop_frame(); return; }\n")
 		for i, p := range s.Parameters {
 			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
 		}
 		for _, bs := range s.Body.Statements {
 			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
 		}
+		funcs.WriteString("    kv_pop_frame();\n")
 		funcs.WriteString("}\n")
 		c.curComponent = oldComp
 		return ""
@@ -1160,12 +1368,14 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 	case *ast.FunctionStatement:
 		fName := "volt_fn_" + s.Name.Value
 		funcs.WriteString("VoltValue* " + fName + "_impl(int argc, VoltValue** argv) {\n")
+		funcs.WriteString("    KV_ENTER_FRAME(\"" + s.Name.Value + "\", \"script\", " + strconv.Itoa(s.Token.Line) + ");\n")
 		for i, p := range s.Parameters {
 			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
 		}
 		for _, bs := range s.Body.Statements {
 			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
 		}
+		funcs.WriteString("    KV_EXIT_FRAME();\n")
 		funcs.WriteString("    return make_int(0);\n}\n")
 		return indent + s.Name.Value + " = make_fn(" + fName + "_impl);\n"
 	case *ast.ReturnStatement:
@@ -1234,15 +1444,20 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 	case *ast.TryCatchStatement:
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
-		funcs.WriteString("void volt_try_" + id + "(void* arg) {\n")
+		funcs.WriteString("VoltValue* volt_try_" + id + "(void* arg) {\n")
+		funcs.WriteString("    KV_ENTER_FRAME(\"try_block\", \"script\", " + strconv.Itoa(s.Token.Line) + ");\n")
 		funcs.WriteString(c.transpileStatement(s.TryBody, funcs, "    "))
+		funcs.WriteString("    KV_EXIT_FRAME();\n")
+		funcs.WriteString("    return make_ok(make_int(0));\n")
 		funcs.WriteString("}\n")
-		return indent + "{ jmp_buf env_" + id + "; current_jmp_env = &env_" + id + ";\n" +
-			indent + "if (setjmp(env_" + id + ") == 0) {\n" +
-			indent + "    volt_try_" + id + "(NULL);\n" +
-			indent + "} else {\n" +
-			indent + "    volt_set_value(&" + s.CatchVariable.Value + ", make_str(\"OS Exception\"));\n" +
-			c.transpileStatement(s.CatchBody, funcs, indent+"    ") + indent + "} }\n"
+		return indent + "{\n" +
+			indent + "    VoltValue* _tr = volt_try_" + id + "(NULL);\n" +
+			indent + "    if (_tr->type == TYPE_RESULT && !_tr->res.is_ok) {\n" +
+			indent + "        volt_set_value(&" + s.CatchVariable.Value + ", volt_value_copy(_tr->res.val));\n" +
+			c.transpileStatement(s.CatchBody, funcs, indent+"        ") +
+			indent + "    }\n" +
+			indent + "    volt_value_free(_tr);\n" +
+			indent + "}\n"
 	case *ast.SpawnStatement:
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
