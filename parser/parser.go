@@ -74,6 +74,8 @@ func (p *Parser) parseStatement() ast.Statement {
 		return p.parseFSMacroStatement()
 	case token.GO_BLOCK, token.RUST_BLOCK, token.JS_BLOCK, token.PY_BLOCK:
 		return p.parsePolyglotBlockStatement()
+	case token.IMPORT_UI:
+		return p.parseImportUIStatement()
 	case token.IMPORT_COMPONENT:
 		return p.parseImportComponentStatement()
 	case token.COMPONENT:
@@ -388,6 +390,18 @@ func (p *Parser) parseFSMacroStatement() *ast.FSMacroStatement {
 
 func (p *Parser) parsePolyglotBlockStatement() *ast.PolyglotBlockStatement {
 	stmt := &ast.PolyglotBlockStatement{Token: p.curToken, Code: p.curToken.Literal}
+	return stmt
+}
+
+func (p *Parser) parseImportUIStatement() *ast.ImportUIStatement {
+	stmt := &ast.ImportUIStatement{Token: p.curToken}
+	if p.peekToken.Type == token.IDENT || p.peekToken.Type == token.STRING {
+		p.nextToken()
+		stmt.Path = p.curToken.Literal
+	} else {
+		p.peekError(token.STRING)
+		return nil
+	}
 	return stmt
 }
 

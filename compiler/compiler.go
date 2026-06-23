@@ -1078,6 +1078,8 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 			}
 		case *ast.DispatchJobStatement:
 			walker(n.Body)
+		case *ast.ImportUIStatement:
+			c.collectFromUILoader(n.Path, processed, walker)
 		case *ast.ImportComponentStatement:
 			c.collectFromImport(n.Path, processed, walker)
 		case *ast.InfixExpression:
@@ -1105,6 +1107,27 @@ func (c *Compiler) collectGlobalVars(program *ast.Program) {
 		}
 	}
 	walker(program)
+}
+
+func (c *Compiler) collectFromUILoader(path string, processed map[string]bool, walker func(interface{})) {
+	// Components
+	compDir := filepath.Join(path, "components")
+	if entries, err := os.ReadDir(compDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".kv") {
+				c.collectFromImport(filepath.Join(compDir, entry.Name()), processed, walker)
+			}
+		}
+	}
+	// Pages
+	pageDir := filepath.Join(path, "pages")
+	if entries, err := os.ReadDir(pageDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".kv") {
+				c.collectFromImport(filepath.Join(pageDir, entry.Name()), processed, walker)
+			}
+		}
+	}
 }
 
 func (c *Compiler) collectFromImport(path string, processed map[string]bool, walker func(interface{})) {
@@ -1290,6 +1313,9 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		funcs.WriteString("    kv_pop_frame();\n")
 		funcs.WriteString("}\n")
 		c.curComponent = oldComp
+		return ""
+	case *ast.ImportUIStatement:
+		c.processUILoader(s.Path, funcs)
 		return ""
 	case *ast.ImportComponentStatement:
 		c.processImport(s.Path, s.Alias.Value, funcs)
@@ -1496,6 +1522,62 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return indent + "// Middleware block execution\n"
 	}
 	return ""
+}
+
+func (c *Compiler) processUILoader(path string, funcs *strings.Builder) {
+	// 1. Recursive scan components/ and register building blocks
+	compDir := filepath.Join(path, "components")
+	if entries, err := os.ReadDir(compDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".kv") {
+				c.processImport(filepath.Join(compDir, entry.Name()), "", funcs)
+			}
+		}
+	}
+
+	// 2. Scan pages/ and map to static URL paths
+	pageDir := filepath.Join(path, "pages")
+	if entries, err := os.ReadDir(pageDir); err == nil {
+		routerName := "router_auto_ui"
+		if !strings.Contains(funcs.String(), "Router "+routerName) {
+			funcs.WriteString("Router " + routerName + " = { .name = \"auto_ui\", .count = 0 };\n")
+			c.webBlocks = append(c.webBlocks, "    volt_start_web_server(&"+routerName+", 8080);\n")
+			c.HasNetworking = true
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".kv") {
+				name := strings.TrimSuffix(entry.Name(), ".kv")
+				routePath := "/" + name
+				if name == "index" {
+					routePath = "/"
+				}
+
+				// Generate handler that renders this page
+				handlerName := "handler_auto_" + name + "_" + strconv.Itoa(c.funcID)
+				c.funcID++
+
+				// We need to parse the page to find components or logic
+				pagePath := filepath.Join(pageDir, entry.Name())
+				data, _ := os.ReadFile(pagePath)
+				subL := lexer.New(string(data))
+				subP := parser.New(subL)
+				subProg := subP.ParseProgram()
+
+				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				funcs.WriteString("    KV_ENTER_FRAME(\"auto_handler\", \"web\", 0);\n")
+				c.isInWebRoute = true
+				for _, stmt := range subProg.Statements {
+					funcs.WriteString(c.transpileStatement(stmt, funcs, "    "))
+				}
+				c.isInWebRoute = false
+				funcs.WriteString("    KV_EXIT_FRAME();\n")
+				funcs.WriteString("}\n")
+				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
+					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + routePath + "\", " + handlerName + ", false }; }\n")
+			}
+		}
+	}
 }
 
 func (c *Compiler) processImport(path string, aliasPrefix string, funcs *strings.Builder) {

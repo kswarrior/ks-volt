@@ -83,6 +83,7 @@ const (
 	REQUEST_FORM     = "REQUEST_FORM"
 	REQUEST_JSON     = "REQUEST_JSON"
 	BACKTICK         = "BACKTICK"
+	IMPORT_UI        = "IMPORT_UI"
 
 	IMPORT = "IMPORT"
 	EXPORT = "EXPORT"
@@ -137,6 +138,7 @@ var keywords = map[string]TokenType{
 	"dispatch_job":     DISPATCH_JOB,
 	"request_form":     REQUEST_FORM,
 	"request_json":     REQUEST_JSON,
+	"import_ui":        IMPORT_UI,
 	"import":           IMPORT,
 	"export":           EXPORT,
 	"from":             FROM,

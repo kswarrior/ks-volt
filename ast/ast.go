@@ -206,6 +206,14 @@ type PolyglotBlockStatement struct {
 func (ps *PolyglotBlockStatement) statementNode()       {}
 func (ps *PolyglotBlockStatement) TokenLiteral() string { return ps.Token.Literal }
 
+type ImportUIStatement struct {
+	Token token.Token
+	Path  string
+}
+
+func (is *ImportUIStatement) statementNode()       {}
+func (is *ImportUIStatement) TokenLiteral() string { return is.Token.Literal }
+
 type ImportComponentStatement struct {
 	Token token.Token
 	Path  string
