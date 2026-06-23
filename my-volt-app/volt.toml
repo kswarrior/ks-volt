@@ -1,0 +1,6 @@
+[project]
+name = "MyVoltApp"
+version = "1.0.0"
+
+[build]
+main = "backend/src/main.kv"

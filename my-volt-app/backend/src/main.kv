@@ -1,0 +1,16 @@
+import_ui "../.."
+
+web_block "main_app" {
+    path("/login") -> {
+        method = request_header("Method")
+        if (1) {
+            user = request_form("username")
+            if (1) {
+                db_save("session", user)
+                redirect("/dashboard")
+            }
+        }
+    }
+}
+
+print("MyVoltApp Backend Initialized")

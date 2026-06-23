@@ -141,9 +141,14 @@ func (c *Compiler) Compile(program *ast.Program) string {
 #include <dirent.h>
 #include <stdatomic.h>
 #include <stddef.h>
+
+#ifndef _WIN32
 #include <ucontext.h>
 #include <sys/epoll.h>
 #include <dlfcn.h>
+#else
+#include <windows.h>
+#endif
 
 struct VoltGreenThread;
 extern __thread struct VoltGreenThread* current_green_thread;
@@ -189,10 +194,11 @@ void volt_buf_append(VoltBuffer* b, const char* s) {
     b->len += slen;
     b->data[b->len] = '\0';
 
-    if (b->len > b->high_watermark && current_green_thread) {
+    if (b->len > b->high_watermark && current_green_thread && current_green_thread->fd != -1) {
         b->paused = true;
-        // In Node.js, we yield here. We'll resume when kernel drains.
-        // For our simplified implementation, we yield to allow other tasks to run.
+        struct epoll_event ev = { .events = EPOLLOUT | EPOLLONESHOT, .data.ptr = current_green_thread };
+        epoll_ctl(global_epoll_fd, EPOLL_CTL_MOD, current_green_thread->fd, &ev);
+        current_green_thread->state = THREAD_PARKED;
         volt_scheduler_yield();
     }
 }
@@ -219,6 +225,14 @@ typedef struct VoltValue {
 
 typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
 
+#define MAX_FRAMES 128
+typedef struct KVFrame {
+    const char* func_name;
+    const char* file;
+    int line;
+    jmp_buf env;
+} KVFrame;
+
 typedef struct VoltGreenThread {
     ucontext_t context;
     void* stack;
@@ -226,6 +240,8 @@ typedef struct VoltGreenThread {
     void* arg;
     int fd;
     ThreadState state;
+    KVFrame frames[MAX_FRAMES];
+    int frame_ptr;
 } VoltGreenThread;
 
 extern __thread VoltGreenThread* current_green_thread;
@@ -244,41 +260,30 @@ __thread VoltGreenThread* current_green_thread = NULL;
 
 struct Router;
 
-typedef struct KVFrame {
-    const char* func_name;
-    const char* file;
-    int line;
-    jmp_buf env;
-} KVFrame;
-
-#define MAX_FRAMES 128
-extern __thread KVFrame kv_frame_stack[MAX_FRAMES];
-extern __thread int kv_frame_ptr;
-
-__thread KVFrame kv_frame_stack[MAX_FRAMES];
-__thread int kv_frame_ptr = -1;
-
 void kv_push_frame(const char* fn, const char* file, int line) {
-    if (kv_frame_ptr < MAX_FRAMES - 1) {
-        kv_frame_ptr++;
-        kv_frame_stack[kv_frame_ptr].func_name = fn;
-        kv_frame_stack[kv_frame_ptr].file = file;
-        kv_frame_stack[kv_frame_ptr].line = line;
+    if (current_green_thread && current_green_thread->frame_ptr < MAX_FRAMES - 1) {
+        current_green_thread->frame_ptr++;
+        current_green_thread->frames[current_green_thread->frame_ptr].func_name = fn;
+        current_green_thread->frames[current_green_thread->frame_ptr].file = file;
+        current_green_thread->frames[current_green_thread->frame_ptr].line = line;
     }
 }
 
 void kv_pop_frame() {
-    if (kv_frame_ptr >= 0) kv_frame_ptr--;
+    if (current_green_thread && current_green_thread->frame_ptr >= 0) current_green_thread->frame_ptr--;
 }
 
 void kv_backtrace() {
+    if (!current_green_thread) return;
     printf("--- KV Backtrace ---\n");
-    for (int i = kv_frame_ptr; i >= 0; i--) {
-        printf("  at %s (%s:%d)\n", kv_frame_stack[i].func_name, kv_frame_stack[i].file, kv_frame_stack[i].line);
+    for (int i = current_green_thread->frame_ptr; i >= 0; i--) {
+        printf("  at %s (%s:%d)\n", current_green_thread->frames[i].func_name, current_green_thread->frames[i].file, current_green_thread->frames[i].line);
     }
 }
 
-#define KV_ENTER_FRAME(fn, file, line) kv_push_frame(fn, file, line); if (setjmp(kv_frame_stack[kv_frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
+#define KV_ENTER_FRAME(fn, file, line) kv_push_frame(fn, file, line);
+#define KV_RECOVERY_POINT() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
+#define KV_RECOVERY_POINT_VOID() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { kv_pop_frame(); return; }
 #define KV_EXIT_FRAME() kv_pop_frame();
 
 void volt_plugin_register(const char* path, struct Router* r) {
@@ -820,6 +825,7 @@ void volt_dispatch_route(void* arg) {
 
     int flags = fcntl(ctx->client_fd, F_GETFL, 0);
     fcntl(ctx->client_fd, F_SETFL, flags | O_NONBLOCK);
+    current_green_thread->fd = ctx->client_fd;
 
     char buffer[4096];
     int n;
@@ -859,6 +865,7 @@ void volt_dispatch_route(void* arg) {
             if (target->is_ws) {
                 write(ctx->client_fd, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", 78);
                 target->handler(ctx);
+                return; // Maintain FD for spawned tasks
             } else {
                 target->handler(ctx);
                 fflush(stdout);
@@ -979,6 +986,7 @@ const char* to_str(VoltValue* v) {
 
 	if !c.HasNetworking {
 		sb.WriteString(`    // Seccomp Sandbox: Networking disabled
+    #ifndef _WIN32
     #include <linux/seccomp.h>
     #include <linux/filter.h>
     #include <sys/prctl.h>
@@ -996,6 +1004,7 @@ const char* to_str(VoltValue* v) {
     struct sock_fprog prog = { .len = (unsigned short)(sizeof(filter)/sizeof(filter[0])), .filter = filter };
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+    #endif
 `)
 	}
 
@@ -1008,6 +1017,11 @@ const char* to_str(VoltValue* v) {
 	sb.WriteString("        pthread_mutex_init(&processors[i].lock, NULL);\n")
 	sb.WriteString("        pthread_create(&workers[i], NULL, worker_loop, id);\n")
 	sb.WriteString("    }\n")
+	// Auto-load backend logic from backend/src/
+	if _, err := os.Stat("backend/src"); err == nil {
+		c.scanAndLoadBackend("backend/src", &funcs, &mainBody)
+	}
+
 	for _, block := range c.webBlocks {
 		sb.WriteString(block)
 	}
@@ -1302,15 +1316,15 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		c.curComponent = s.Name.Value
 		fName := "render_" + s.Name.Value
 		funcs.WriteString("void " + fName + "(VoltBuffer* ctx, int argc, VoltValue** argv) {\n")
-		funcs.WriteString("    kv_push_frame(\"" + s.Name.Value + "\", \"component\", 0);\n")
-		funcs.WriteString("    if (setjmp(kv_frame_stack[kv_frame_ptr].env) != 0) { kv_pop_frame(); return; }\n")
+		funcs.WriteString("    KV_ENTER_FRAME(\"" + s.Name.Value + "\", \"component\", 0);\n")
+		funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
 		for i, p := range s.Parameters {
 			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
 		}
 		for _, bs := range s.Body.Statements {
 			funcs.WriteString(c.transpileStatement(bs, funcs, "    "))
 		}
-		funcs.WriteString("    kv_pop_frame();\n")
+		funcs.WriteString("    KV_EXIT_FRAME();\n")
 		funcs.WriteString("}\n")
 		c.curComponent = oldComp
 		return ""
@@ -1342,9 +1356,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				handlerName := "handler_" + strconv.Itoa(c.funcID)
 				c.funcID++
 				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				funcs.WriteString("    KV_ENTER_FRAME(\"handler\", \"web\", 0);\n")
+				funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
 				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
 				c.isInWebRoute = false
+				funcs.WriteString("    KV_EXIT_FRAME();\n")
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
 					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", false }; }\n")
@@ -1352,9 +1369,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				handlerName := "handler_" + strconv.Itoa(c.funcID)
 				c.funcID++
 				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				funcs.WriteString("    KV_ENTER_FRAME(\"handler_ws\", \"web\", 0);\n")
+				funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
 				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
 				c.isInWebRoute = false
+				funcs.WriteString("    KV_EXIT_FRAME();\n")
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
 					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + r.Path + "\", " + handlerName + ", true }; }\n")
@@ -1362,9 +1382,12 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 				handlerName := "before_" + name + "_" + strconv.Itoa(c.funcID)
 				c.funcID++
 				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
+				funcs.WriteString("    KV_ENTER_FRAME(\"before\", \"web\", 0);\n")
+				funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
 				c.isInWebRoute = true
 				funcs.WriteString(c.transpileStatement(r.Body, funcs, "    "))
 				c.isInWebRoute = false
+				funcs.WriteString("    KV_EXIT_FRAME();\n")
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " + routerName + ".before = " + handlerName + "; }\n")
 			}
@@ -1525,22 +1548,26 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 }
 
 func (c *Compiler) processUILoader(path string, funcs *strings.Builder) {
-	// 1. Recursive scan components/ and register building blocks
+	// Support for my-volt-app structure: frontend/components, frontend/pages, frontend/layout
 	compDir := filepath.Join(path, "components")
-	if entries, err := os.ReadDir(compDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".kv") {
-				c.processImport(filepath.Join(compDir, entry.Name()), "", funcs)
-			}
+	if _, err := os.Stat(compDir); err != nil {
+		// Try frontend/ subfolder
+		if _, err := os.Stat(filepath.Join(path, "frontend/components")); err == nil {
+			path = filepath.Join(path, "frontend")
+			compDir = filepath.Join(path, "components")
 		}
 	}
+
+	// 1. Recursive scan components/ and layout/ and register building blocks
+	c.scanAndImport(compDir, funcs)
+	c.scanAndImport(filepath.Join(path, "layout"), funcs)
 
 	// 2. Scan pages/ and map to static URL paths
 	pageDir := filepath.Join(path, "pages")
 	if entries, err := os.ReadDir(pageDir); err == nil {
-		routerName := "router_auto_ui"
+		routerName := "router_main_app"
 		if !strings.Contains(funcs.String(), "Router "+routerName) {
-			funcs.WriteString("Router " + routerName + " = { .name = \"auto_ui\", .count = 0 };\n")
+			funcs.WriteString("Router " + routerName + " = { .name = \"main_app\", .count = 0 };\n")
 			c.webBlocks = append(c.webBlocks, "    volt_start_web_server(&"+routerName+", 8080);\n")
 			c.HasNetworking = true
 		}
@@ -1566,6 +1593,7 @@ func (c *Compiler) processUILoader(path string, funcs *strings.Builder) {
 
 				funcs.WriteString("void " + handlerName + "(VoltContext* ctx) {\n")
 				funcs.WriteString("    KV_ENTER_FRAME(\"auto_handler\", \"web\", 0);\n")
+				funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
 				c.isInWebRoute = true
 				for _, stmt := range subProg.Statements {
 					funcs.WriteString(c.transpileStatement(stmt, funcs, "    "))
@@ -1575,6 +1603,39 @@ func (c *Compiler) processUILoader(path string, funcs *strings.Builder) {
 				funcs.WriteString("}\n")
 				funcs.WriteString("__attribute__((constructor)) void init_" + handlerName + "() { " +
 					routerName + ".routes[" + routerName + ".count++] = (Route){\"" + routePath + "\", " + handlerName + ", false }; }\n")
+			}
+		}
+	}
+}
+
+func (c *Compiler) scanAndLoadBackend(dir string, funcs, mainBody *strings.Builder) {
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, entry := range entries {
+			fullPath := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				c.scanAndLoadBackend(fullPath, funcs, mainBody)
+			} else if strings.HasSuffix(entry.Name(), ".kv") {
+				// Don't reload the main file if it's in the same directory
+				data, _ := os.ReadFile(fullPath)
+				subL := lexer.New(string(data))
+				subP := parser.New(subL)
+				subProg := subP.ParseProgram()
+				for _, stmt := range subProg.Statements {
+					mainBody.WriteString(c.transpileStatement(stmt, funcs, "    "))
+				}
+			}
+		}
+	}
+}
+
+func (c *Compiler) scanAndImport(dir string, funcs *strings.Builder) {
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, entry := range entries {
+			fullPath := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				c.scanAndImport(fullPath, funcs)
+			} else if strings.HasSuffix(entry.Name(), ".kv") {
+				c.processImport(fullPath, "", funcs)
 			}
 		}
 	}

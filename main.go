@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/pelletier/go-toml/v2"
 	"ks-volt/compiler"
 	"ks-volt/lexer"
 	"ks-volt/parser"
@@ -12,7 +13,24 @@ import (
 	"time"
 )
 
+type VoltConfig struct {
+	Project struct {
+		Name    string
+		Version string
+	}
+	Build struct {
+		Main string
+	}
+}
+
 func main() {
+	// 1. Check for volt.toml
+	if _, err := os.Stat("volt.toml"); err == nil {
+		fmt.Println("KS-Volt Manifest detected. Building project structure...")
+		runProjectBuild()
+		return
+	}
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: ks-volt <filename.kv> OR ks-volt watch <filename.kv>")
 		os.Exit(1)
@@ -47,6 +65,29 @@ func main() {
 	} else {
 		runCompilation(filename)
 	}
+}
+
+func runProjectBuild() {
+	data, err := os.ReadFile("volt.toml")
+	if err != nil {
+		fmt.Printf("Error reading volt.toml: %v\n", err)
+		os.Exit(1)
+	}
+
+	var config VoltConfig
+	err = toml.Unmarshal(data, &config)
+	if err != nil {
+		fmt.Printf("Error parsing volt.toml: %v\n", err)
+		os.Exit(1)
+	}
+
+	mainFile := config.Build.Main
+	if mainFile == "" {
+		mainFile = "backend/src/main.kv"
+	}
+
+	fmt.Printf("Building application '%s' (%s)...\n", config.Project.Name, config.Project.Version)
+	runCompilation(mainFile)
 }
 
 func runCompilation(filename string) {
