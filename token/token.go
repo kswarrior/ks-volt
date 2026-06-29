@@ -23,6 +23,7 @@ const (
 	PLUS   = "+"
 	DOT    = "."
 	ARROW  = "->"
+	SLASH  = "/"
 
 	// Delimiters
 	COMMA     = ","
@@ -84,6 +85,9 @@ const (
 	REQUEST_JSON     = "REQUEST_JSON"
 	BACKTICK         = "BACKTICK"
 	IMPORT_UI        = "IMPORT_UI"
+	YIELD            = "YIELD"
+	GROUP            = "GROUP"
+	RAW              = "RAW"
 
 	IMPORT = "IMPORT"
 	EXPORT = "EXPORT"
@@ -92,6 +96,12 @@ const (
 	OK     = "OK"
 	ERR    = "ERR"
 	MUT    = "MUT"
+
+	ELLIPSIS = "..."
+	COLON    = ":"
+	LT       = "<"
+	GT       = ">"
+	EQ       = "=="
 )
 
 var keywords = map[string]TokenType{
@@ -139,6 +149,9 @@ var keywords = map[string]TokenType{
 	"request_form":     REQUEST_FORM,
 	"request_json":     REQUEST_JSON,
 	"import_ui":        IMPORT_UI,
+	"yield":            YIELD,
+	"group":            GROUP,
+	"raw":              RAW,
 	"import":           IMPORT,
 	"export":           EXPORT,
 	"from":             FROM,

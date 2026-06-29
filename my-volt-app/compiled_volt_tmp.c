@@ -62,38 +62,6 @@ void volt_buf_grow(VoltBuffer* b, size_t needed) {
     b->data = realloc(b->data, b->cap);
 }
 
-typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
-
-#define MAX_FRAMES 128
-typedef struct KVFrame {
-    const char* func_name;
-    const char* file;
-    int line;
-    jmp_buf env;
-} KVFrame;
-
-typedef void (*VoltYieldFn)(VoltBuffer*);
-
-typedef struct VoltGreenThread {
-#ifndef _WIN32
-    ucontext_t context;
-#else
-    void* fiber;
-#endif
-    void* stack;
-    void (*func)(void*);
-    void* arg;
-    int fd;
-    ThreadState state;
-    KVFrame frames[MAX_FRAMES];
-    int frame_ptr;
-    VoltYieldFn current_yield;
-} VoltGreenThread;
-
-extern __thread VoltGreenThread* current_green_thread;
-extern int global_epoll_fd;
-void volt_scheduler_yield();
-
 void volt_buf_append(VoltBuffer* b, const char* s) {
     if (!b || !s) return;
     size_t slen = strlen(s);
@@ -131,21 +99,43 @@ typedef struct VoltValue {
     };
 } VoltValue;
 
+typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
+
+#define MAX_FRAMES 128
+typedef struct KVFrame {
+    const char* func_name;
+    const char* file;
+    int line;
+    jmp_buf env;
+} KVFrame;
+
+typedef void (*VoltYieldFn)(VoltBuffer*);
+
+typedef struct VoltGreenThread {
+    ucontext_t context;
+    void* stack;
+    void (*func)(void*);
+    void* arg;
+    int fd;
+    ThreadState state;
+    KVFrame frames[MAX_FRAMES];
+    int frame_ptr;
+    VoltYieldFn current_yield;
+} VoltGreenThread;
+
+extern __thread VoltGreenThread* current_green_thread;
+
 typedef struct {
-    void* queue[MAX_TASKS]; // Use void* to avoid circular dependency
+    VoltGreenThread* queue[MAX_TASKS];
     int head, tail;
     pthread_mutex_t lock;
-#ifndef _WIN32
     ucontext_t worker_context;
-#else
-    void* worker_fiber;
-#endif
 } Processor;
 
 Processor processors[NUM_WORKERS];
 pthread_t workers[NUM_WORKERS];
 __thread int worker_id;
-__thread struct VoltGreenThread* current_green_thread = NULL;
+__thread VoltGreenThread* current_green_thread = NULL;
 
 struct Router;
 
@@ -171,8 +161,8 @@ void kv_backtrace() {
 }
 
 #define KV_ENTER_FRAME(fn, file, line) kv_push_frame(fn, file, line);
-#define KV_RECOVERY_POINT() if (current_green_thread->frame_ptr >= 0 && setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
-#define KV_RECOVERY_POINT_VOID() if (current_green_thread->frame_ptr >= 0 && setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { kv_pop_frame(); return; }
+#define KV_RECOVERY_POINT() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
+#define KV_RECOVERY_POINT_VOID() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { kv_pop_frame(); return; }
 #define KV_EXIT_FRAME() kv_pop_frame();
 
 void render_yield(VoltBuffer* ctx) {
@@ -198,11 +188,7 @@ void volt_netpoller_init() {
 
 void volt_scheduler_yield() {
     if (current_green_thread) {
-#ifndef _WIN32
         swapcontext(&current_green_thread->context, &processors[worker_id].worker_context);
-#else
-        SwitchToFiber(processors[worker_id].worker_fiber);
-#endif
     }
 }
 
@@ -222,7 +208,6 @@ typedef struct {
     int client_fd;
     char* method;
     char* path;
-    struct VoltValue* params;
     char* headers[50];
     int header_count;
     int status;
@@ -266,7 +251,7 @@ void enqueue_thread(int p_id, VoltGreenThread* t) {
 }
 
 void schedule_task(int p_id, void (*func)(void*), void* arg) {
-    VoltGreenThread* t = calloc(1, sizeof(VoltGreenThread)); t->frame_ptr = -1;
+    VoltGreenThread* t = malloc(sizeof(VoltGreenThread));
     t->func = func;
     t->arg = arg;
     t->state = THREAD_READY;
@@ -482,18 +467,6 @@ void volt_buf_append_value(VoltBuffer* b, VoltValue* v) {
     }
 }
 
-void volt_buf_append_attrs(VoltBuffer* b, VoltValue* m) {
-    if (!m || m->type != TYPE_MAP) return;
-    for (int i = 0; i < m->m.len; i++) {
-        volt_buf_append(b, " ");
-        volt_buf_append(b, m->m.keys[i]);
-        volt_buf_append(b, "=\"");
-        char buf[128];
-        volt_buf_append_escaped(b, to_str_buf(m->m.values[i], buf));
-        volt_buf_append(b, "\"");
-    }
-}
-
 VoltValue* dynamic_add(VoltValue* a, VoltValue* b) {
     char buf1[128], buf2[128];
     const char* s1 = to_str_buf(a, buf1); const char* s2 = to_str_buf(b, buf2);
@@ -574,9 +547,9 @@ void volt_file_write(const char* fn, const char* data) {
     FILE* f = fopen(fn, "w");
     if (!f) {
         pthread_mutex_unlock(&db_file_lock);
-        if (current_green_thread && current_green_thread->frame_ptr >= 0) {
+        if (kv_frame_ptr >= 0) {
             kv_backtrace();
-            longjmp((current_green_thread->frame_ptr >= 0 ? current_green_thread->frames[current_green_thread->frame_ptr].env : NULL), 1);
+            longjmp(kv_frame_stack[kv_frame_ptr].env, 1);
         }
         return;
     }
@@ -785,42 +758,8 @@ void volt_dispatch_route(void* arg) {
         ctx->path = strdup(path_str ? path_str : "/");
 
         Route* target = NULL;
-        ctx->params = volt_track_alloc(sizeof(VoltValue));
-        ctx->params->type = TYPE_MAP; ctx->params->m.len = 0;
-        ctx->params->m.keys = malloc(10 * sizeof(char*));
-        ctx->params->m.values = malloc(10 * sizeof(VoltValue*));
-        volt_track_alloc_raw(ctx->params->m.keys);
-        volt_track_alloc_raw(ctx->params->m.values);
-
         for(int i=0; i<args->r->count; i++) {
-            char* r_path = args->r->routes[i].path;
-            if (strchr(r_path, ':')) {
-                // Dynamic matching
-                char* p_copy = strdup(ctx->path);
-                char* r_copy = strdup(r_path);
-                char* p_save, *r_save;
-                char* p_tok = strtok_r(p_copy, "/", &p_save);
-                char* r_tok = strtok_r(r_copy, "/", &r_save);
-                bool match = true;
-                while (p_tok && r_tok) {
-                    if (r_tok[0] == ':') {
-                        ctx->params->m.keys[ctx->params->m.len] = strdup(r_tok + 1);
-                        volt_track_alloc_raw(ctx->params->m.keys[ctx->params->m.len]);
-                        ctx->params->m.values[ctx->params->m.len++] = make_str(p_tok);
-                    } else if (strcmp(p_tok, r_tok) != 0) {
-                        match = false; break;
-                    }
-                    p_tok = strtok_r(NULL, "/", &p_save);
-                    r_tok = strtok_r(NULL, "/", &r_save);
-                }
-                if (match && !p_tok && !r_tok) {
-                    target = &args->r->routes[i];
-                    free(p_copy); free(r_copy);
-                    break;
-                }
-                free(p_copy); free(r_copy);
-                ctx->params->m.len = 0; // Reset params for next try
-            } else if (strcmp(r_path, ctx->path) == 0) {
+            if (strcmp(args->r->routes[i].path, ctx->path) == 0) {
                 target = &args->r->routes[i];
                 break;
             }
@@ -928,54 +867,69 @@ const char* to_str(VoltValue* v) {
 }
 #include "deps/quickjs.h"
 #include "deps/quickjs-libc.h"
-VoltValue* test_yield;
-VoltValue* callback;
-VoltValue* volt_fn_callback_impl(int argc, VoltValue** argv) {
-    KV_ENTER_FRAME("callback", "script", 1);
-    volt_value_free(({ VoltValue* _rv = NULL; VoltValue* _a0 = make_str("Yielded block executed"); VoltValue** _argv = malloc(1 * sizeof(VoltValue*)); _argv[0] = _a0; printf("%s\n", to_str(_a0)); volt_value_free(_a0); free(_argv); _rv; }));
+void render_Card(VoltBuffer* ctx, int argc, VoltValue** argv) {
+    KV_ENTER_FRAME("Card", "component", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_buf_append(ctx, "<div class=\"card\">");
+    render_yield(ctx);
+    volt_buf_append(ctx, "</div>");
     KV_EXIT_FRAME();
-    return make_int(0);
 }
-VoltValue* volt_fn_test_yield_impl(int argc, VoltValue** argv) {
-    KV_ENTER_FRAME("test_yield", "script", 5);
-    VoltValue* c = argv[0];
-    volt_value_free(({ VoltValue* _rv = NULL; VoltValue* _a0 = make_str("Inside test_yield"); VoltValue** _argv = malloc(1 * sizeof(VoltValue*)); _argv[0] = _a0; printf("%s\n", to_str(_a0)); volt_value_free(_a0); free(_argv); _rv; }));
+void render_Footer(VoltBuffer* ctx, int argc, VoltValue** argv) {
+    KV_ENTER_FRAME("Footer", "component", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_buf_append(ctx, "<footer>Powered by KS-Volt</footer>");
     KV_EXIT_FRAME();
-    return make_int(0);
 }
+void render_Sidebar(VoltBuffer* ctx, int argc, VoltValue** argv) {
+    KV_ENTER_FRAME("Sidebar", "component", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_buf_append(ctx, "<aside>Sidebar Content</aside>");
+    KV_EXIT_FRAME();
+}
+void render_Navbar(VoltBuffer* ctx, int argc, VoltValue** argv) {
+    KV_ENTER_FRAME("Navbar", "component", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_buf_append(ctx, "<nav>Navbar Content</nav>");
+    KV_EXIT_FRAME();
+}
+Router router_main_app = { .name = "main_app", .count = 0 };
+void handler_auto_dashboard_0(VoltContext* ctx) {
+    KV_ENTER_FRAME("auto_handler", "web", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_value_free(({ VoltValue* _rv = NULL; VoltValue** _argv = NULL; render_Navbar(current_web_ctx->response_body, 0, _argv); _rv; }));
+    volt_value_free(({ VoltValue* _rv = NULL; VoltValue** _argv = NULL; render_Card(current_web_ctx->response_body, 0, _argv); _rv; }));
+    volt_value_free(make_str(""));
+    volt_buf_append(current_web_ctx->response_body, "<h1>XSS Test: ");
+    volt_buf_append(current_web_ctx->response_body, "<script>alert(1)</script>");
+    volt_buf_append(current_web_ctx->response_body, "</h1>");
+    volt_buf_append(current_web_ctx->response_body, "<h2>Raw Test: ");
+    { VoltValue* _tmp = ({ VoltValue* _v = make_str("<p>Safe HTML</p>"); if (_v->type == TYPE_STR) volt_buf_append(ctx, _v->s); volt_value_free(_v); make_str(""); }); volt_buf_append_value(current_web_ctx->response_body, _tmp); volt_value_free(_tmp); }
+    volt_buf_append(current_web_ctx->response_body, "</h2>");
+    volt_value_free(make_str(""));
+    volt_value_free(({ VoltValue* _rv = NULL; VoltValue** _argv = NULL; render_Footer(current_web_ctx->response_body, 0, _argv); _rv; }));
+    KV_EXIT_FRAME();
+}
+__attribute__((constructor)) void init_handler_auto_dashboard_0() { router_main_app.routes[router_main_app.count++] = (Route){"/dashboard", handler_auto_dashboard_0, false }; }
+Router router_main_app = { .name = "main_app", .count = 0 };
+void handler_1(VoltContext* ctx) {
+    KV_ENTER_FRAME("handler", "web", 0);
+    KV_RECOVERY_POINT_VOID();
+    volt_buf_append(current_web_ctx->response_body, "Login Page");
+    KV_EXIT_FRAME();
+}
+__attribute__((constructor)) void init_handler_1() { router_main_app.routes[router_main_app.count++] = (Route){"/login", handler_1, false }; }
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    // Seccomp Sandbox: Networking disabled
-    #ifndef _WIN32
-    #include <linux/seccomp.h>
-    #include <linux/filter.h>
-    #include <sys/prctl.h>
-    #include <sys/syscall.h>
-    struct sock_filter filter[] = {
-        BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_socket, 0, 1),
-        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_bind, 0, 1),
-        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
-        BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_listen, 0, 1),
-        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),
-        BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW),
-    };
-    struct sock_fprog prog = { .len = (unsigned short)(sizeof(filter)/sizeof(filter[0])), .filter = filter };
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
-    #endif
     srand(time(NULL));
     for(int i=0; i<NUM_WORKERS; i++) {
         int* id = malloc(sizeof(int)); *id = i;
         pthread_mutex_init(&processors[i].lock, NULL);
         pthread_create(&workers[i], NULL, worker_loop, id);
     }
-    callback = make_fn(volt_fn_callback_impl);
-    test_yield = make_fn(volt_fn_test_yield_impl);
-    volt_value_free(({ VoltValue* _rv = NULL; VoltValue** _argv = NULL; _rv = callback->f(0, _argv); _rv; }));
-    volt_value_free(({ VoltValue* _rv = NULL; VoltValue* _a0 = make_str("Test complete"); VoltValue** _argv = malloc(1 * sizeof(VoltValue*)); _argv[0] = _a0; printf("%s\n", to_str(_a0)); volt_value_free(_a0); free(_argv); _rv; }));
-    volt_value_free(({ VoltValue* _rv = NULL; VoltValue* _a0 = make_int(0); VoltValue** _argv = malloc(1 * sizeof(VoltValue*)); _argv[0] = _a0; exit((int)_a0->i); volt_value_free(_a0); free(_argv); _rv; }));
+    volt_start_web_server(&router_main_app, 8080);
+    volt_start_web_server(&router_main_app, 8080);
+    volt_value_free(({ VoltValue* _rv = NULL; VoltValue* _a0 = make_str("MyVoltApp Backend Initialized"); VoltValue** _argv = malloc(1 * sizeof(VoltValue*)); _argv[0] = _a0; printf("%s\n", to_str(_a0)); volt_value_free(_a0); free(_argv); _rv; }));
     while(1) sleep(1); return 0;
 }

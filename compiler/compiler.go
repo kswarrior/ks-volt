@@ -186,6 +186,38 @@ void volt_buf_grow(VoltBuffer* b, size_t needed) {
     b->data = realloc(b->data, b->cap);
 }
 
+typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
+
+#define MAX_FRAMES 128
+typedef struct KVFrame {
+    const char* func_name;
+    const char* file;
+    int line;
+    jmp_buf env;
+} KVFrame;
+
+typedef void (*VoltYieldFn)(VoltBuffer*);
+
+typedef struct VoltGreenThread {
+#ifndef _WIN32
+    ucontext_t context;
+#else
+    void* fiber;
+#endif
+    void* stack;
+    void (*func)(void*);
+    void* arg;
+    int fd;
+    ThreadState state;
+    KVFrame frames[MAX_FRAMES];
+    int frame_ptr;
+    VoltYieldFn current_yield;
+} VoltGreenThread;
+
+extern __thread VoltGreenThread* current_green_thread;
+extern int global_epoll_fd;
+void volt_scheduler_yield();
+
 void volt_buf_append(VoltBuffer* b, const char* s) {
     if (!b || !s) return;
     size_t slen = strlen(s);
@@ -223,40 +255,21 @@ typedef struct VoltValue {
     };
 } VoltValue;
 
-typedef enum { THREAD_READY, THREAD_RUNNING, THREAD_PARKED, THREAD_FINISHED } ThreadState;
-
-#define MAX_FRAMES 128
-typedef struct KVFrame {
-    const char* func_name;
-    const char* file;
-    int line;
-    jmp_buf env;
-} KVFrame;
-
-typedef struct VoltGreenThread {
-    ucontext_t context;
-    void* stack;
-    void (*func)(void*);
-    void* arg;
-    int fd;
-    ThreadState state;
-    KVFrame frames[MAX_FRAMES];
-    int frame_ptr;
-} VoltGreenThread;
-
-extern __thread VoltGreenThread* current_green_thread;
-
 typedef struct {
-    VoltGreenThread* queue[MAX_TASKS];
+    void* queue[MAX_TASKS]; // Use void* to avoid circular dependency
     int head, tail;
     pthread_mutex_t lock;
+#ifndef _WIN32
     ucontext_t worker_context;
+#else
+    void* worker_fiber;
+#endif
 } Processor;
 
 Processor processors[NUM_WORKERS];
 pthread_t workers[NUM_WORKERS];
 __thread int worker_id;
-__thread VoltGreenThread* current_green_thread = NULL;
+__thread struct VoltGreenThread* current_green_thread = NULL;
 
 struct Router;
 
@@ -282,9 +295,15 @@ void kv_backtrace() {
 }
 
 #define KV_ENTER_FRAME(fn, file, line) kv_push_frame(fn, file, line);
-#define KV_RECOVERY_POINT() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
-#define KV_RECOVERY_POINT_VOID() if (setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { kv_pop_frame(); return; }
+#define KV_RECOVERY_POINT() if (current_green_thread->frame_ptr >= 0 && setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { VoltValue* _err = make_err(make_str("KV Runtime Error")); kv_pop_frame(); return _err; }
+#define KV_RECOVERY_POINT_VOID() if (current_green_thread->frame_ptr >= 0 && setjmp(current_green_thread->frames[current_green_thread->frame_ptr].env) != 0) { kv_pop_frame(); return; }
 #define KV_EXIT_FRAME() kv_pop_frame();
+
+void render_yield(VoltBuffer* ctx) {
+    if (current_green_thread && current_green_thread->current_yield) {
+        current_green_thread->current_yield(ctx);
+    }
+}
 
 void volt_plugin_register(const char* path, struct Router* r) {
     void* handle = dlopen(path, RTLD_NOW);
@@ -303,7 +322,11 @@ void volt_netpoller_init() {
 
 void volt_scheduler_yield() {
     if (current_green_thread) {
+#ifndef _WIN32
         swapcontext(&current_green_thread->context, &processors[worker_id].worker_context);
+#else
+        SwitchToFiber(processors[worker_id].worker_fiber);
+#endif
     }
 }
 
@@ -323,6 +346,7 @@ typedef struct {
     int client_fd;
     char* method;
     char* path;
+    struct VoltValue* params;
     char* headers[50];
     int header_count;
     int status;
@@ -366,7 +390,7 @@ void enqueue_thread(int p_id, VoltGreenThread* t) {
 }
 
 void schedule_task(int p_id, void (*func)(void*), void* arg) {
-    VoltGreenThread* t = malloc(sizeof(VoltGreenThread));
+    VoltGreenThread* t = calloc(1, sizeof(VoltGreenThread)); t->frame_ptr = -1;
     t->func = func;
     t->arg = arg;
     t->state = THREAD_READY;
@@ -556,9 +580,42 @@ void volt_buf_append_json(VoltBuffer* b, VoltValue* v) {
     }
 }
 
+void volt_buf_append_escaped(VoltBuffer* b, const char* s) {
+    if (!s) return;
+    for (int i = 0; s[i]; i++) {
+        switch(s[i]) {
+            case '&': volt_buf_append(b, "&amp;"); break;
+            case '<': volt_buf_append(b, "&lt;"); break;
+            case '>': volt_buf_append(b, "&gt;"); break;
+            case '"': volt_buf_append(b, "&quot;"); break;
+            case '\'': volt_buf_append(b, "&#39;"); break;
+            default: {
+                char buf[2] = {s[i], 0};
+                volt_buf_append(b, buf);
+            }
+        }
+    }
+}
+
 void volt_buf_append_value(VoltBuffer* b, VoltValue* v) {
     char buf[128];
-    volt_buf_append(b, to_str_buf(v, buf));
+    if (v->type == TYPE_STR) {
+        volt_buf_append_escaped(b, v->s);
+    } else {
+        volt_buf_append(b, to_str_buf(v, buf));
+    }
+}
+
+void volt_buf_append_attrs(VoltBuffer* b, VoltValue* m) {
+    if (!m || m->type != TYPE_MAP) return;
+    for (int i = 0; i < m->m.len; i++) {
+        volt_buf_append(b, " ");
+        volt_buf_append(b, m->m.keys[i]);
+        volt_buf_append(b, "=\"");
+        char buf[128];
+        volt_buf_append_escaped(b, to_str_buf(m->m.values[i], buf));
+        volt_buf_append(b, "\"");
+    }
 }
 
 VoltValue* dynamic_add(VoltValue* a, VoltValue* b) {
@@ -641,9 +698,9 @@ void volt_file_write(const char* fn, const char* data) {
     FILE* f = fopen(fn, "w");
     if (!f) {
         pthread_mutex_unlock(&db_file_lock);
-        if (kv_frame_ptr >= 0) {
+        if (current_green_thread && current_green_thread->frame_ptr >= 0) {
             kv_backtrace();
-            longjmp(kv_frame_stack[kv_frame_ptr].env, 1);
+            longjmp((current_green_thread->frame_ptr >= 0 ? current_green_thread->frames[current_green_thread->frame_ptr].env : NULL), 1);
         }
         return;
     }
@@ -852,8 +909,42 @@ void volt_dispatch_route(void* arg) {
         ctx->path = strdup(path_str ? path_str : "/");
 
         Route* target = NULL;
+        ctx->params = volt_track_alloc(sizeof(VoltValue));
+        ctx->params->type = TYPE_MAP; ctx->params->m.len = 0;
+        ctx->params->m.keys = malloc(10 * sizeof(char*));
+        ctx->params->m.values = malloc(10 * sizeof(VoltValue*));
+        volt_track_alloc_raw(ctx->params->m.keys);
+        volt_track_alloc_raw(ctx->params->m.values);
+
         for(int i=0; i<args->r->count; i++) {
-            if (strcmp(args->r->routes[i].path, ctx->path) == 0) {
+            char* r_path = args->r->routes[i].path;
+            if (strchr(r_path, ':')) {
+                // Dynamic matching
+                char* p_copy = strdup(ctx->path);
+                char* r_copy = strdup(r_path);
+                char* p_save, *r_save;
+                char* p_tok = strtok_r(p_copy, "/", &p_save);
+                char* r_tok = strtok_r(r_copy, "/", &r_save);
+                bool match = true;
+                while (p_tok && r_tok) {
+                    if (r_tok[0] == ':') {
+                        ctx->params->m.keys[ctx->params->m.len] = strdup(r_tok + 1);
+                        volt_track_alloc_raw(ctx->params->m.keys[ctx->params->m.len]);
+                        ctx->params->m.values[ctx->params->m.len++] = make_str(p_tok);
+                    } else if (strcmp(p_tok, r_tok) != 0) {
+                        match = false; break;
+                    }
+                    p_tok = strtok_r(NULL, "/", &p_save);
+                    r_tok = strtok_r(NULL, "/", &r_save);
+                }
+                if (match && !p_tok && !r_tok) {
+                    target = &args->r->routes[i];
+                    free(p_copy); free(r_copy);
+                    break;
+                }
+                free(p_copy); free(r_copy);
+                ctx->params->m.len = 0; // Reset params for next try
+            } else if (strcmp(r_path, ctx->path) == 0) {
                 target = &args->r->routes[i];
                 break;
             }
@@ -1318,6 +1409,9 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		funcs.WriteString("void " + fName + "(VoltBuffer* ctx, int argc, VoltValue** argv) {\n")
 		funcs.WriteString("    KV_ENTER_FRAME(\"" + s.Name.Value + "\", \"component\", 0);\n")
 		funcs.WriteString("    KV_RECOVERY_POINT_VOID();\n")
+		if s.HasSpread {
+			funcs.WriteString("    VoltValue* attrs = argv[argc-1];\n")
+		}
 		for i, p := range s.Parameters {
 			funcs.WriteString("    VoltValue* " + p.Value + " = argv[" + strconv.Itoa(i) + "];\n")
 		}
@@ -1336,6 +1430,11 @@ func (c *Compiler) transpileStatement(stmt ast.Statement, funcs *strings.Builder
 		return ""
 	case *ast.RenderFragmentStatement:
 		return indent + "if (current_web_ctx) { current_web_ctx->is_fragment = true; volt_buf_free(current_web_ctx->response_body); current_web_ctx->response_body = volt_buf_new(); ctx->response_body = current_web_ctx->response_body; }\n"
+	case *ast.YieldStatement:
+		return indent + "render_yield(ctx);\n"
+	case *ast.GroupStatement:
+		// Groups simply execute their body, but for dynamic paths they would manage scope
+		return c.transpileStatement(s.Body, funcs, indent)
 	case *ast.DispatchJobStatement:
 		id := strconv.Itoa(c.funcID)
 		c.funcID++
@@ -1886,6 +1985,35 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 		case "upper":
 			return "str_upper(" + objArg + ")", true
 		}
+	case *ast.HtmlElement:
+		ctxName := "current_web_ctx->response_body"
+		if c.curComponent != "" {
+			ctxName = "ctx"
+		}
+		res := "({ VoltBuffer* _b = " + ctxName + "; "
+		res += "volt_buf_append(_b, \"<" + e.Tag + "\"); "
+		for k, v := range e.Attributes {
+			attrName := k
+			if k == "get" || k == "post" || k == "target" || k == "swap" {
+				attrName = "data-v-" + k
+			}
+			res += "volt_buf_append(_b, \" " + attrName + "=\\\"\"); "
+			res += c.transpileToBuffer(v, "_b", "")
+			res += "volt_buf_append(_b, \"\\\"\"); "
+		}
+		res += "volt_buf_append(_b, \">\"); "
+		if e.Body != nil {
+			res += c.transpileStatement(e.Body, nil, "")
+		}
+		res += "volt_buf_append(_b, \"</" + e.Tag + ">\"); make_str(\"\"); })"
+		return res, true
+	case *ast.RawExpression:
+		code, isTemp := c.transpileExpression(e.Value)
+		// We use specialized buffer append for raw data
+		if isTemp {
+			return "({ VoltValue* _v = " + code + "; if (_v->type == TYPE_STR) volt_buf_append(ctx, _v->s); volt_value_free(_v); make_str(\"\"); })", true
+		}
+		return "({ if (" + code + "->type == TYPE_STR) volt_buf_append(ctx, " + code + "->s); make_str(\"\"); })", true
 	case *ast.CallExpression:
 		var funcCode string
 		var isFuncTemp bool
@@ -1909,46 +2037,65 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 			}
 		}
 
+	slotName := ""
+	if e.Body != nil {
+		slotName = "volt_slot_" + strconv.Itoa(c.funcID)
+		c.funcID++
+		c.extraFuncs.WriteString("void " + slotName + "(VoltBuffer* ctx) {\n")
+		oldComp := c.curComponent
+		c.curComponent = "slot"
+		c.extraFuncs.WriteString(c.transpileStatement(e.Body, nil, "    "))
+		c.curComponent = oldComp
+		c.extraFuncs.WriteString("}\n")
+	}
+
 	res := "({ VoltValue* _rv = NULL; "
-		if isFuncTemp {
-			res += "VoltValue* _f = " + funcCode + "; "
-		}
-		for i, code := range argCodes {
-			res += fmt.Sprintf("VoltValue* _a%d = %s; ", i, code)
-		}
+	if isFuncTemp {
+		res += "VoltValue* _f = " + funcCode + "; "
+	}
+	for i, code := range argCodes {
+		res += fmt.Sprintf("VoltValue* _a%d = %s; ", i, code)
+	}
 
-		if len(argCodes) > 0 {
-			res += fmt.Sprintf("VoltValue** _argv = malloc(%d * sizeof(VoltValue*)); ", len(argCodes))
-			for i := range argCodes {
-				res += fmt.Sprintf("_argv[%d] = _a%d; ", i, i)
-			}
+	if len(argCodes) > 0 {
+		res += fmt.Sprintf("VoltValue** _argv = malloc(%d * sizeof(VoltValue*)); ", len(argCodes))
+		for i := range argCodes {
+			res += fmt.Sprintf("_argv[%d] = _a%d; ", i, i)
+		}
+	} else {
+		res += "VoltValue** _argv = NULL; "
+	}
+
+	compName := ""
+	if name != "" {
+		if c.components[name] {
+			compName = name
+		} else if c.components[c.curPrefix+name] {
+			compName = c.curPrefix + name
+		} else if alias, ok := c.ComponentAliases[name]; ok {
+			compName = alias
+		}
+	}
+
+	if compName != "" {
+		if slotName != "" {
+			res += "VoltYieldFn _old_yield = current_green_thread->current_yield; "
+			res += "current_green_thread->current_yield = " + slotName + "; "
+		}
+		ctxParam := "NULL"
+		if c.curComponent != "" {
+			ctxParam = "ctx"
+		} else if c.isInWebRoute {
+			ctxParam = "current_web_ctx->response_body"
 		} else {
-			res += "VoltValue** _argv = NULL; "
+			res += "VoltBuffer* _b = volt_buf_new(); render_" + compName + "(_b, " + strconv.Itoa(len(argCodes)) + ", _argv); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); "
 		}
-
-		compName := ""
-		if name != "" {
-			if c.components[name] {
-				compName = name
-			} else if c.components[c.curPrefix+name] {
-				compName = c.curPrefix + name
-			} else if alias, ok := c.ComponentAliases[name]; ok {
-				compName = alias
-			}
+		if c.curComponent != "" || c.isInWebRoute {
+			res += "render_" + compName + "(" + ctxParam + ", " + strconv.Itoa(len(argCodes)) + ", _argv); "
 		}
-
-		if compName != "" {
-			ctxParam := "NULL"
-			if c.curComponent != "" {
-				ctxParam = "ctx"
-			} else if c.isInWebRoute {
-				ctxParam = "current_web_ctx->response_body"
-			} else {
-				res += "VoltBuffer* _b = volt_buf_new(); render_" + compName + "(_b, " + strconv.Itoa(len(argCodes)) + ", _argv); if (_b->len > 0) printf(\"%s\\n\", _b->data); volt_buf_free(_b); "
-			}
-			if c.curComponent != "" || c.isInWebRoute {
-				res += "render_" + compName + "(" + ctxParam + ", " + strconv.Itoa(len(argCodes)) + ", _argv); "
-			}
+		if slotName != "" {
+			res += "current_green_thread->current_yield = _old_yield; "
+		}
 		} else if name != "" {
 			switch name {
 			case "print":
@@ -1966,6 +2113,8 @@ func (c *Compiler) transpileExpression(expr ast.Expression) (string, bool) {
 				res += "_rv = volt_request_form(to_str(_a0)); "
 			case "request_json":
 				res += "_rv = volt_request_json(); "
+			case "request_param":
+				res += "_rv = map_get(current_web_ctx->params, to_str(_a0)); "
 			case "json_parse":
 				res += "_rv = json_parse(to_str(_a0)); "
 			case "db_save":

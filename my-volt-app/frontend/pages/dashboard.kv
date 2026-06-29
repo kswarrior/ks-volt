@@ -1,3 +1,6 @@
 Navbar()
-Sidebar()
-`<main><h1>Dashboard</h1><p>Welcome to your project-structured app!</p></main>`
+Card() {
+    `<h1>XSS Test: ${"<script>alert(1)</script>"}</h1>`
+    `<h2>Raw Test: ${raw("<p>Safe HTML</p>")}</h2>`
+}
+Footer()

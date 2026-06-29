@@ -64,11 +64,34 @@ func (l *Lexer) NextToken() token.Token {
 
 	switch l.ch {
 	case '=':
-		tok = newToken(token.ASSIGN, l.ch, line, col)
+		if l.peekChar() == '=' {
+			ch := l.ch
+			l.readChar()
+			literal := string(ch) + string(l.ch)
+			tok = token.Token{Type: token.EQ, Literal: literal, Line: line, Column: col}
+		} else {
+			tok = newToken(token.ASSIGN, l.ch, line, col)
+		}
+	case ':':
+		tok = newToken(token.COLON, l.ch, line, col)
+	case '<':
+		tok = newToken(token.LT, l.ch, line, col)
+	case '>':
+		tok = newToken(token.GT, l.ch, line, col)
 	case '+':
 		tok = newToken(token.PLUS, l.ch, line, col)
 	case '.':
-		tok = newToken(token.DOT, l.ch, line, col)
+		if l.peekChar() == '.' {
+			l.readChar()
+			if l.peekChar() == '.' {
+				l.readChar()
+				tok = token.Token{Type: token.ELLIPSIS, Literal: "...", Line: line, Column: col}
+			} else {
+				tok = newToken(token.DOT, '.', line, col) // Should ideally be handled
+			}
+		} else {
+			tok = newToken(token.DOT, l.ch, line, col)
+		}
 	case ',':
 		tok = newToken(token.COMMA, l.ch, line, col)
 	case '(':
