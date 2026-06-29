@@ -1,0 +1,29 @@
+import_ui web
+
+web_block "main_app" {
+    path("/login") -> {
+        method = request_header("Method")
+        if (1) {
+            user = request_form("username")
+            pword = request_form("password")
+
+            if (1) {
+                db_save("session", user)
+                redirect("/dashboard")
+            } else {
+                `Login failed. Invalid credentials.`
+            }
+        } else {
+            `<form method="POST"><input name="username"/><input name="password" type="password"/><button>Login</button></form>`
+        }
+    }
+
+    path_ws("/dashboard") -> {
+        spawn interval(1000) {
+            cpu = 45
+            print( `{"cpu": ${cpu}}`)
+        }
+    }
+}
+
+print("KS-Volt server running on port 8080")

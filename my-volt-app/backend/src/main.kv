@@ -1,0 +1,15 @@
+import_ui "../../frontend"
+
+web_block "main_app" {
+    group("/admin") {
+        path("/dashboard") -> {
+            print("Admin Access Verified")
+        }
+    }
+
+    path("/login") -> {
+        `Login Page`
+    }
+}
+
+print("MyVoltApp Backend Initialized")

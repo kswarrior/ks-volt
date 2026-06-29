@@ -20,31 +20,50 @@ import_component "ui/navbar.kv" as UI
 UI.Navbar("Home")
 ```
 
+## 📂 Automatic UI Loader (`import_ui`)
+
+The `import_ui` directive enables a file-system-based routing and component registration system, balancing automated layout loading with backend control.
+
+### Usage
+```kv
+import_ui "web"
+```
+
+### Mechanism
+- **Global Components**: All `.kv` files inside the `web/components/` directory are recursively scanned and registered as global building blocks.
+- **Automated Routing**: Files inside `web/pages/` are automatically mapped to static URL paths.
+    - `web/pages/index.kv` maps to `/`
+    - `web/pages/about.kv` maps to `/about`
+    - `web/pages/contact.kv` maps to `/contact`
+
 ## 🌐 Web Routing Engine
 
 The `web_block` provides a dedicated DSL for defining high-performance controllers and routing logic.
 
 ### DSL Structure
 ```kv
-web_block "api_v1" {
+web_block "main_app" {
     before_each -> {
         print("Incoming request...")
     }
 
-    path("/status") -> {
-        `{"status": "online"}`
+    path("/login") -> {
+        // Explicit POST handler
+        if (request_header("Method") == "POST") {
+            // ... auth logic
+        }
     }
 
-    path_ws("/events") -> {
-        // WebSocket handler logic
+    path_ws("/dashboard") -> {
+        // Real-time metrics via WebSocket
     }
 }
 ```
 
-### Internal Implementation
-*   **Routing Jump Tables**: Routes are registered using C constructors (`__attribute__((constructor))`), creating an efficient jump table for the dispatcher.
-*   **Buffer Inlining**: Interpolated string literals inside routes are automatically directed to the response buffer, avoiding intermediate heap allocations.
+### Route Precedence
+Explicit `path()` and `path_ws()` blocks defined inside a `web_block` always take precedence over automatically generated routes from `import_ui`. This allows developers to intercept static pages and inject dynamic data or handle complex state mutations seamlessly.
 
-## ⚡ Zero-Allocation Rendering
+## ⚡ Zero-Allocation & Backpressure
 
-When a component is called within a web route or another component, it receives a reference to a `VoltBuffer`. The rendering process consists of direct character-array appends, ensuring minimal RAM usage even under high concurrency.
+*   **Zero-Allocation Rendering**: When a component is called, it appends data directly to a `VoltBuffer`, ensuring minimal RAM usage.
+*   **Built-in Backpressure**: The `VoltBuffer` API integrates with the KS-Volt Netpoller. If a slow client causes kernel write buffers to saturate, the generating green thread is automatically parked until the buffer drains, preventing memory exhaustion under high load.

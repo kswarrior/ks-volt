@@ -166,6 +166,7 @@ type CallExpression struct {
 	Token     token.Token
 	Function  Expression
 	Arguments []Expression
+	Body      *BlockStatement
 }
 
 func (ce *CallExpression) expressionNode()      {}
@@ -206,6 +207,14 @@ type PolyglotBlockStatement struct {
 func (ps *PolyglotBlockStatement) statementNode()       {}
 func (ps *PolyglotBlockStatement) TokenLiteral() string { return ps.Token.Literal }
 
+type ImportUIStatement struct {
+	Token token.Token
+	Path  string
+}
+
+func (is *ImportUIStatement) statementNode()       {}
+func (is *ImportUIStatement) TokenLiteral() string { return is.Token.Literal }
+
 type ImportComponentStatement struct {
 	Token token.Token
 	Path  string
@@ -219,6 +228,7 @@ type ComponentDefinition struct {
 	Token      token.Token
 	Name       *Identifier
 	Parameters []*Identifier
+	HasSpread  bool
 	Body       *BlockStatement
 }
 
@@ -266,6 +276,30 @@ type RenderFragmentStatement struct {
 
 func (rs *RenderFragmentStatement) statementNode()       {}
 func (rs *RenderFragmentStatement) TokenLiteral() string { return rs.Token.Literal }
+
+type YieldStatement struct {
+	Token token.Token
+}
+
+func (ys *YieldStatement) statementNode()       {}
+func (ys *YieldStatement) TokenLiteral() string { return ys.Token.Literal }
+
+type GroupStatement struct {
+	Token token.Token
+	Path  string
+	Body  *BlockStatement
+}
+
+func (gs *GroupStatement) statementNode()       {}
+func (gs *GroupStatement) TokenLiteral() string { return gs.Token.Literal }
+
+type RawExpression struct {
+	Token token.Token
+	Value Expression
+}
+
+func (re *RawExpression) expressionNode()      {}
+func (re *RawExpression) TokenLiteral() string { return re.Token.Literal }
 
 type DispatchJobStatement struct {
 	Token     token.Token
@@ -331,3 +365,29 @@ type MatchResultStatement struct {
 
 func (mrs *MatchResultStatement) statementNode()       {}
 func (mrs *MatchResultStatement) TokenLiteral() string { return mrs.Token.Literal }
+
+type EllipsisExpression struct {
+	Token token.Token // ...
+	Value Expression
+}
+
+func (ee *EllipsisExpression) expressionNode()      {}
+func (ee *EllipsisExpression) TokenLiteral() string { return ee.Token.Literal }
+
+type MapLiteral struct {
+	Token token.Token // {
+	Pairs map[Expression]Expression
+}
+
+func (ml *MapLiteral) expressionNode()      {}
+func (ml *MapLiteral) TokenLiteral() string { return ml.Token.Literal }
+
+type HtmlElement struct {
+	Token      token.Token
+	Tag        string
+	Attributes map[string]Expression
+	Body       Statement
+}
+
+func (he *HtmlElement) expressionNode()      {}
+func (he *HtmlElement) TokenLiteral() string { return he.Token.Literal }
